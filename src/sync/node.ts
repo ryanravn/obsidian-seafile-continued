@@ -12,7 +12,11 @@ export type STATE_UPLOAD = {
 	param: {
 		progress: number,
 		fs: SeafFs | null,
-		blocks?: Record<string, ArrayBuffer>
+		source?: {
+			path: string,
+			size: number,
+			mtime: number
+		}
 	}
 }
 export type STATE_SYNC = {

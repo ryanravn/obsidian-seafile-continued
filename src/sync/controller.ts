@@ -1,9 +1,9 @@
 import * as IgnoreParser from "gitignore-parser";
 import { posix as Path } from "path-browserify";
-import { Notice, Platform, type DataAdapter } from "obsidian";
+import { FileSystemAdapter, Notice, Platform, type DataAdapter } from "obsidian";
 import { type SeafileSettings } from "src/settings";
 import { DEFAULT_IGNORE, HEAD_COMMIT_PATH, SYNC_DATA_PATH, SYNC_DLOG_PATH, server } from "../config";
-import { MODE_DIR, MODE_FILE, ZeroFs, type DirSeafDirent, type DirSeafFs, type FileSeafDirent, type FileSeafFs, type SeafDirent, type SeafFs } from "../server";
+import { MODE_DIR, MODE_FILE, TYPE_FILE, ZeroFs, type DirSeafDirent, type DirSeafFs, type FileSeafDirent, type FileSeafFs, type SeafDirent, type SeafFs } from "../server";
 import * as utils from "../utils";
 import { debug } from "../utils";
 import { SyncNode, type STATE_UPLOAD, type SyncStateChangedListener as NodeStateChangedListener } from "./node";
@@ -32,6 +32,12 @@ export interface SYNC_STOP {
 export type SyncStatus = SYNC_IDLE | SYNC_BUSY | SYNC_STOP
 
 export class SyncController {
+	private static readonly LARGE_FILE_WARNING_BYTES = 50 * 1024 * 1024;
+	private static readonly BLOCK_UPLOAD_CONCURRENCY = 2;
+	private static readonly BLOCK_CHECK_BATCH_SIZE = 1000;
+	private fileIoTail: Promise<void> = Promise.resolve();
+	private readonly warnedLargeMobileFiles = new Set<string>();
+
 	private ignore: {
     accepts: (input: string) => boolean
     denies: (input: string) => boolean
@@ -48,6 +54,82 @@ export class SyncController {
 
 	public setIgnorePattern (pattern: string) {
 		this.ignore = IgnoreParser.compile(DEFAULT_IGNORE + "\n" + pattern);
+	}
+
+	// Recursive pull walks siblings concurrently. Serialize the expensive file
+	// bodies so a large directory cannot place several complete mobile files (or
+	// many desktop block buffers) in memory at once.
+	private async withFileIoSlot<T> (task: () => Promise<T>): Promise<T> {
+		const previous = this.fileIoTail;
+		let release = (): void => {};
+		this.fileIoTail = new Promise<void>(resolve => { release = resolve; });
+		await previous;
+		try {
+			return await task();
+		} finally {
+			release();
+		}
+	}
+
+	private async assertFileUnchanged (path: string, expected: { size: number, mtime: number }): Promise<void> {
+		const current = await utils.fastStat(path);
+		if (!current || current.type !== "file" || current.size !== expected.size || current.mtime !== expected.mtime) {
+			throw new Error(`File '${path}' changed while it was being synchronized. It will be retried on the next sync.`);
+		}
+	}
+
+	private async *readFileBlocks (
+		path: string,
+		expected: { size: number, mtime: number },
+		indices?: ReadonlySet<number>
+	): AsyncGenerator<{ index: number, data: ArrayBuffer }> {
+		await this.assertFileUnchanged(path, expected);
+		const blockCount = Math.ceil(expected.size / utils.SEAFILE_BLOCK_SIZE);
+
+		if (Platform.isDesktop && this.adapter instanceof FileSystemAdapter) {
+			// Obsidian loads desktop plugins as CommonJS. Keeping this as a native
+			// dynamic import leaves `import("fs/promises")` in the bundle, which its
+			// plugin loader cannot resolve. A conditional require uses the loader's
+			// existing Node integration and remains unexecuted on mobile.
+			const { open } = require("fs/promises") as typeof import("fs/promises");
+			const handle = await open(this.adapter.getFullPath(path), "r");
+			try {
+				for (let index = 0; index < blockCount; index++) {
+					if (indices && !indices.has(index)) continue;
+					const offset = index * utils.SEAFILE_BLOCK_SIZE;
+					const length = Math.min(utils.SEAFILE_BLOCK_SIZE, expected.size - offset);
+					const bytes = new Uint8Array(length);
+					let bytesRead = 0;
+					while (bytesRead < length) {
+						const result = await handle.read(bytes, bytesRead, length - bytesRead, offset + bytesRead);
+						if (result.bytesRead === 0) {
+							throw new Error(`File '${path}' ended while it was being synchronized.`);
+						}
+						bytesRead += result.bytesRead;
+					}
+					yield { index, data: bytes.buffer };
+				}
+			} finally {
+				await handle.close();
+			}
+		} else {
+			if (Platform.isMobile && expected.size > SyncController.LARGE_FILE_WARNING_BYTES && !this.warnedLargeMobileFiles.has(path)) {
+				this.warnedLargeMobileFiles.add(path);
+				debug.warn(`File '${path}' is larger than 50 MB. Mobile must temporarily read the complete file into memory.`);
+				new Notice(`Seafile: '${Path.basename(path)}' is larger than 50 MB. Mobile sync may use significant memory.`, 8000);
+			}
+			const buffer = await this.adapter.readBinary(path);
+			if (buffer.byteLength !== expected.size) {
+				throw new Error(`File '${path}' changed while it was being synchronized.`);
+			}
+			for (let index = 0; index < blockCount; index++) {
+				if (indices && !indices.has(index)) continue;
+				const offset = index * utils.SEAFILE_BLOCK_SIZE;
+				yield { index, data: buffer.slice(offset, Math.min(offset + utils.SEAFILE_BLOCK_SIZE, expected.size)) };
+			}
+		}
+
+		await this.assertFileUnchanged(path, expected);
 	}
 
 	// Load sync data
@@ -73,43 +155,45 @@ export class SyncController {
 	}
 
 	async downloadFile (path: string, fsId: string, mtime: number) {
-		this.ignoreChange.add(path);
-		try {
-			mtime = mtime * 1000;
-			await this.adapter.write(path, "", { mtime });
+		return await this.withFileIoSlot(async () => {
+			this.ignoreChange.add(path);
+			try {
+				mtime = mtime * 1000;
+				await this.adapter.write(path, "", { mtime });
 
-			if (fsId == ZeroFs) {
-				return;
-			}
-
-			let nativePath;
-			if (Platform.isMobile) {
-				nativePath = (this.adapter as MobileDataAdapter).getNativePath(path);
-			}
-
-			const [, fs] = await server.getFs(fsId);
-			for (const blockId of (fs as FileSeafFs).block_ids) {
-				const block = await server.getBlock(blockId);
-				if (Platform.isDesktop) {
-					await this.adapter.append(path, new DataView(block) as unknown as string, { mtime });
-				} else {
-					// Hacky way to get the filesystem plugin to append to file when mobile
-					const encoded = await utils.arrayBufferToBase64(block);
-					const capacitor = window.top as unknown as {
-						Capacitor: { Plugins: { Filesystem: { appendFile(options: { path: string; data: string }): Promise<void> } } }
-					};
-					// nativePath is intentionally passed through unchanged to preserve
-					// existing runtime behavior (it is not awaited here).
-					await capacitor.Capacitor.Plugins.Filesystem.appendFile({ path: nativePath as unknown as string, data: encoded });
+				if (fsId == ZeroFs) {
+					return;
 				}
-			}
 
-			if (Platform.isMobile) {
-				await this.adapter.append(path, "", { mtime }); // Set mtime
+				let nativePath;
+				if (Platform.isMobile) {
+					nativePath = (this.adapter as MobileDataAdapter).getNativePath(path);
+				}
+
+				const [, fs] = await server.getFs(fsId);
+				for (const blockId of (fs as FileSeafFs).block_ids) {
+					const block = await server.getBlock(blockId);
+					if (Platform.isDesktop) {
+						await this.adapter.append(path, new DataView(block) as unknown as string, { mtime });
+					} else {
+						// Hacky way to get the filesystem plugin to append to file when mobile
+						const encoded = await utils.arrayBufferToBase64(block);
+						const capacitor = window.top as unknown as {
+							Capacitor: { Plugins: { Filesystem: { appendFile(options: { path: string; data: string }): Promise<void> } } }
+						};
+						// nativePath is intentionally passed through unchanged to preserve
+						// existing runtime behavior (it is not awaited here).
+						await capacitor.Capacitor.Plugins.Filesystem.appendFile({ path: nativePath as unknown as string, data: encoded });
+					}
+				}
+
+				if (Platform.isMobile) {
+					await this.adapter.append(path, "", { mtime }); // Set mtime
+				}
+			} finally {
+				this.ignoreChange.delete(path);
 			}
-		} finally {
-			this.ignoreChange.delete(path);
-		}
+		});
 	}
 
 	public onNodeStateChanged?: NodeStateChangedListener;
@@ -310,9 +394,9 @@ export class SyncController {
 				await node.delete();
 				return;
 			} else if (local.type === "file") {
-				const [dirent, fs, blocks] = await this.computeFileDirent(path, this.settings.account);
+				const [dirent, fs, source] = await this.computeFileDirent(path, this.settings.account);
 				node.setNext(dirent, false);
-				node.state = { type: "upload", param: { progress: 0, fs, blocks } };
+				node.state = { type: "upload", param: { progress: 0, fs, source } };
 				changes.push({ node, type: remote ? "modify" : "add" });
 				return;
 			}
@@ -340,24 +424,27 @@ export class SyncController {
 		}
 	}
 
-	async computeFileDirent (path: string, modifier: string): Promise<[FileSeafDirent, SeafFs | null, Record<string, ArrayBuffer>]> {
+	async computeFileDirent (path: string, modifier: string): Promise<[FileSeafDirent, SeafFs | null, { path: string, size: number, mtime: number }]> {
 		const stat = await utils.fastStat(path);
 		if (!stat) throw new Error("Cannot compute fs of non-existent file");
 
-		let blockBuffer: Record<string, ArrayBuffer> = {};
+		const source = { path, size: stat.size, mtime: stat.mtime };
 		let fsId: string, fs: SeafFs | null;
 
 		if (stat.size == 0) {
 			[fsId, fs] = [ZeroFs, null];
 		} else {
-			// to do: warn if file too large
-			const buffer = await this.adapter.readBinary(path);
-			blockBuffer = server.crypto
-				? await utils.computeBlocksEncrypted(buffer, (chunk) => server.crypto!.encryptBlock(chunk))
-				: await utils.computeBlocks(buffer);
+			const blockIds = await this.withFileIoSlot(async () => {
+				const ids: string[] = [];
+				for await (const { data } of this.readFileBlocks(path, source)) {
+					const wireData = server.crypto ? await server.crypto.encryptBlock(data) : data;
+					ids.push(await utils.sha1(wireData));
+				}
+				return ids;
+			});
 
 			fs = {
-				block_ids: Object.keys(blockBuffer),
+				block_ids: blockIds,
 				size: stat.size,
 				type: 1,
 				version: 1
@@ -374,7 +461,7 @@ export class SyncController {
 			size: stat.size
 		};
 
-		return [dirent, fs, blockBuffer];
+		return [dirent, fs, source];
 	}
 
 	async createDirFs (children: SeafDirent[]): Promise<[string, SeafFs | null]> {
@@ -422,33 +509,63 @@ export class SyncController {
 		return [dirent, fs];
 	}
 
-	async computeBlocks (localPath: string): Promise<Record<string, ArrayBuffer>> {
-		const stat = await utils.fastStat(localPath);
-		if (!stat) throw new Error(`File '${localPath}' does not exist.`);
-		if (stat.type != "file") throw new Error(`Path '${localPath}' is not a file.`);
+	private async uploadFileBlocks (node: SyncNode, state: STATE_UPLOAD): Promise<void> {
+		if (!state.param.source) return;
+		const source = state.param.source;
+		if (!state.param.fs) {
+			await this.assertFileUnchanged(source.path, source);
+			state.param.progress = 1;
+			this.raiseNodeStateChanged(node);
+			return;
+		}
+		if (state.param.fs.type !== TYPE_FILE || !("block_ids" in state.param.fs)) return;
 
-		if (stat.size === 0) {
-			return {};
+		const blockIds = state.param.fs.block_ids;
+		const availability = new Map<string, boolean>();
+		for (let offset = 0; offset < blockIds.length; offset += SyncController.BLOCK_CHECK_BATCH_SIZE) {
+			const batch = blockIds.slice(offset, offset + SyncController.BLOCK_CHECK_BATCH_SIZE);
+			const batchAvailability = await server.checkBlocksList(batch);
+			for (const [id, missing] of batchAvailability) availability.set(id, missing);
+		}
+		const missingIndices = new Set<number>();
+		const scheduledIds = new Set<string>();
+		for (let index = 0; index < blockIds.length; index++) {
+			const id = blockIds[index];
+			if (availability.get(id) && !scheduledIds.has(id)) {
+				missingIndices.add(index);
+				scheduledIds.add(id);
+			}
 		}
 
-		// if size > 50MB, warn user
-		if (stat.size > 50 * 1024 * 1024) {
-			debug.warn(`File '${localPath}' is larger than 50MB. This may take a while or even crash obsidian.`);
+		if (missingIndices.size === 0) {
+			await this.assertFileUnchanged(source.path, source);
+			state.param.progress = 1;
+			this.raiseNodeStateChanged(node);
+			return;
 		}
 
-		const blocks: Record<string, ArrayBuffer> = {};
-		const buffer = await this.adapter.readBinary(localPath);
-		const blockSize = 8 * 1024 * 1024; // 8MB
-		const numBlocks = Math.ceil(stat.size / blockSize);
-		for (let i = 0; i < numBlocks; i++) {
-			const blockStart = i * blockSize;
-			const blockEnd = blockStart + blockSize;
-			const block = buffer.slice(blockStart, blockEnd);
-			const hash = await utils.sha1(block); // Ensure utils.sha1 can handle ArrayBuffer or adjust accordingly
-			blocks[hash] = block;
+		let completed = 0;
+		let batch: Promise<void>[] = [];
+		for await (const { index, data } of this.readFileBlocks(source.path, source, missingIndices)) {
+			const expectedId = blockIds[index];
+			const upload = (async () => {
+				const wireData = server.crypto ? await server.crypto.encryptBlock(data) : data;
+				const actualId = await utils.sha1(wireData);
+				if (actualId !== expectedId) {
+					throw new Error(`File '${source.path}' changed while it was being synchronized. It will be retried on the next sync.`);
+				}
+				await server.uploadBlock(expectedId, wireData);
+				completed++;
+				state.param.progress = completed / missingIndices.size;
+				this.raiseNodeStateChanged(node);
+			})();
+			batch.push(upload);
+			if (batch.length >= SyncController.BLOCK_UPLOAD_CONCURRENCY) {
+				await Promise.all(batch);
+				batch = [];
+			}
 		}
-
-		return blocks;
+		await Promise.all(batch);
 	}
 
 	async push (nodeRoot: SyncNode, changes: NodeChange[], parentCommitId: string): Promise<string> {
@@ -458,22 +575,18 @@ export class SyncController {
 		}
 
 		const uploads = changes.filter(change => change.type == "add" || change.type == "modify").map(change => change.node);
-		// Upload fs
-		await Promise.all(uploads.map(async (node) => {
+		// Process one file at a time. Each file retains at most a small bounded
+		// batch of blocks, and directories retain no content buffers at all.
+		for (const node of uploads) {
 			if (node.state.type !== "upload" || !node.next) {
 				throw Error("Node is not in upload state or has no next");
 			}
 
 			const uploadState: STATE_UPLOAD = node.state;
 			const param = uploadState.param;
-			if (param.blocks) {
-				const blocks: Record<string, ArrayBuffer> = param.blocks;
-				await Promise.all(Object.entries(blocks).map(async ([blockId, block]: [string, ArrayBuffer]) => {
-					if (await server.checkBlock(blockId)) { await server.sendBlock(blockId, block); }
-				}));
-			}
+			await this.uploadFileBlocks(node, uploadState);
 			if (param.fs && await server.checkFs(node.next.id)) { await server.sendFs([node.next.id, param.fs]); }
-		}));
+		}
 
 		// Create commit
 		const description = server.describeCommit({

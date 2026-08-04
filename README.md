@@ -32,7 +32,7 @@ Per-file sync status is shown next to file names in the explorer.
 ## Notes
 
 1. **Use it at your own risk.** This plugin is still under development. There is a risk of data corruption or loss. Keep backups of anything important.
-2. **No large files.** Due to limitations of Obsidian's API, downloading or uploading files larger than ~50 MB may take a long time or crash the app. Don't sync large attachments through this plugin.
+2. **Large files.** Desktop uploads are processed in 8 MB blocks with bounded memory use. Obsidian's mobile API still requires uploads to be read into memory as a complete file, so files larger than 50 MB trigger a warning and may remain slow or memory-intensive on mobile.
 3. **Clear vault** if you hit issues. The action removes all local files and resyncs from the server.
 4. **Don't interrupt syncing**, especially during upload (upload icon shown). Closing Obsidian mid-sync can corrupt data on the server.
 5. **Hidden files** (anything starting with a dot, e.g. `.obsidian`) are not tracked continuously due to API limits. They are only updated at plugin startup.

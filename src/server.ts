@@ -757,8 +757,15 @@ export default class Server {
 	async sendBlock (id: string, data: ArrayBuffer): Promise<void> {
 		const needUpload = await this.checkBlock(id);
 		if (needUpload) {
-			await this.requestSeafHttp({ url: `repo/${this.settings.repoId}/block/${id}`, method: "PUT", body: data, retry: 0, responseType: "text" });
+			await this.uploadBlock(id, data);
 		}
+	}
+
+	// Upload a block already known to be absent. Callers that have a complete
+	// file manifest can batch check all block IDs and avoid one extra round trip
+	// per block by using this method directly.
+	async uploadBlock (id: string, data: ArrayBuffer): Promise<void> {
+		await this.requestSeafHttp({ url: `repo/${this.settings.repoId}/block/${id}`, method: "PUT", body: data, retry: 0, responseType: "text" });
 	}
 
 	// check if the blocks are in the server
