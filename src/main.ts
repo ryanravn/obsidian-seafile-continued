@@ -1,9 +1,10 @@
 import { Notice, Plugin } from "obsidian";
-import * as IgnoreParser from "gitignore-parser";
-import { DEFAULT_IGNORE, initConfig, PLUGIN_DIR } from "./config";
+import { initConfig, PLUGIN_DIR } from "./config";
+import { SEAFILE_IGNORE_FILE } from "./ignore";
 import { RepoCrypto } from "./crypto";
 import { getPasswordStore } from "./password_store";
 import Server from "./server";
+import { SeafileNotificationClient } from "./notification";
 import { DEFAULT_SETTINGS, type SeafileSettings } from "./settings";
 import { SyncController } from "./sync/controller";
 import { Explorer } from "./ui/explorer";
@@ -16,6 +17,7 @@ export default class SeafilePlugin extends Plugin {
 	server: Server;
 	sync: SyncController;
 	explorerView: Explorer;
+	notifications: SeafileNotificationClient;
 
 	async onload(): Promise<void> {
 		this.settings = await this.loadSettings();
@@ -23,6 +25,8 @@ export default class SeafilePlugin extends Plugin {
 		initConfig(this.app, this.server, this.manifest.id);
 
 		this.sync = new SyncController(this.app.vault.adapter, this.settings);
+		this.notifications = new SeafileNotificationClient(this.settings, this.server, () => this.sync.requestSync());
+		this.sync.onRepositoryUnavailable = () => this.notifications.stop();
 		this.explorerView = new Explorer(this, this.sync);
 
 		this.registerEvent(this.app.vault.on("create", (file) => {
@@ -84,6 +88,7 @@ export default class SeafilePlugin extends Plugin {
 	async disableSync(): Promise<void> {
 		this.settings.enableSync = false;
 		await this.saveSettings();
+		this.notifications.stop();
 		if (this.sync.status.type === "stop") return;
 		await this.sync.stopSyncAsync();
 	}
@@ -111,6 +116,32 @@ export default class SeafilePlugin extends Plugin {
 
 		await this.sync.init();
 		this.sync.startSync();
+		this.notifications.start();
+	}
+
+	async setNotificationsEnabled(enabled: boolean): Promise<void> {
+		this.settings.enableNotifications = enabled;
+		await this.saveSettings();
+		this.refreshNotifications();
+	}
+
+	async setNotificationUrl(url: string): Promise<void> {
+		this.settings.notificationUrl = url;
+		await this.saveSettings();
+		this.refreshNotifications();
+	}
+
+	refreshNotifications(): void {
+		if (this.settings.enableNotifications && this.settings.enableSync && this.checkSyncReady() && this.sync.status.type !== "stop") {
+			this.notifications.start();
+		} else {
+			this.notifications.stop();
+		}
+	}
+
+	async resetSyncForRepositoryChange(): Promise<void> {
+		this.notifications.stop();
+		await this.sync.resetForRepositoryChange();
 	}
 
 	private async whenLayoutReady(): Promise<void> {
@@ -139,6 +170,7 @@ export default class SeafilePlugin extends Plugin {
 			return;
 		}
 		this.sync.startSync();
+		this.refreshNotifications();
 		new Notice("Sync started");
 	}
 
@@ -212,10 +244,10 @@ export default class SeafilePlugin extends Plugin {
 		}
 
 		try {
-			const ignore = IgnoreParser.compile(DEFAULT_IGNORE + "\n" + this.settings.ignore);
+			await this.sync.reloadIgnoreFile();
 
 			const remove = async (path: string, isDir: boolean): Promise<void> => {
-				if (ignore.denies(path)) return;
+				if (path === SEAFILE_IGNORE_FILE || this.sync.isPathIgnored(path, isDir)) return;
 
 				if (!isDir) {
 					await this.app.vault.adapter.remove(path);
@@ -256,6 +288,7 @@ export default class SeafilePlugin extends Plugin {
 	}
 
 	onunload(): void {
+		this.notifications?.stop();
 		if (this.sync) {
 			void this.sync.stopSyncAsync();
 		}
@@ -264,6 +297,9 @@ export default class SeafilePlugin extends Plugin {
 	async loadSettings(): Promise<SeafileSettings> {
 		const data = await this.loadData() as Partial<SeafileSettings> | null;
 		const settings: SeafileSettings = Object.assign({}, DEFAULT_SETTINGS, data);
+		if (!["always", "syncing", "never"].includes(settings.syncStatusTextMode)) {
+			settings.syncStatusTextMode = DEFAULT_SETTINGS.syncStatusTextMode;
+		}
 		return settings;
 	}
 

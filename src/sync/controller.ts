@@ -1,11 +1,11 @@
-import * as IgnoreParser from "gitignore-parser";
 import { posix as Path } from "path-browserify";
-import { Notice, Platform, type DataAdapter } from "obsidian";
+import { FileSystemAdapter, Notice, Platform, type DataAdapter, type Stat } from "obsidian";
 import { type SeafileSettings } from "src/settings";
-import { DEFAULT_IGNORE, HEAD_COMMIT_PATH, SYNC_DATA_PATH, SYNC_DLOG_PATH, server } from "../config";
-import { MODE_DIR, MODE_FILE, ZeroFs, type DirSeafDirent, type DirSeafFs, type FileSeafDirent, type FileSeafFs, type SeafDirent, type SeafFs } from "../server";
+import { DEFAULT_SEAFILE_IGNORE, DOWNLOAD_JOURNAL_PATH, HEAD_COMMIT_PATH, PLUGIN_DIR, SYNC_DATA_PATH, SYNC_DLOG_PATH, server } from "../config";
+import { MODE_DIR, MODE_FILE, RepositoryUnavailableError, TYPE_FILE, ZeroFs, type DirSeafDirent, type DirSeafFs, type FileSeafDirent, type SeafDirent, type SeafFs } from "../server";
 import * as utils from "../utils";
 import { debug } from "../utils";
+import { compileIgnoreList, SEAFILE_IGNORE_FILE, type IgnoreList } from "../ignore";
 import { SyncNode, type STATE_UPLOAD, type SyncStateChangedListener as NodeStateChangedListener } from "./node";
 import { MobileDataAdapter } from "src/@types/obsidian";
 
@@ -16,43 +16,421 @@ export interface NodeChange {
 
 export interface SYNC_IDLE {
   type: "idle"
+  error?: string
 }
 
 export interface SYNC_BUSY {
   type: "busy"
   toStop?: boolean
   message?: "download" | "upload" | "fetch"
+  progress?: SyncProgress
+}
+
+export type SyncProgress = {
+  operation: "prepare" | "download" | "upload"
+  completedFiles: number
+  totalFiles: number
+} | {
+  operation: "check-blocks" | "verify-blocks"
+  completedBlocks: number
+  totalBlocks: number
+} | {
+  operation: "publish-metadata" | "publish-commit" | "save-state" | "compact-state"
+  completedItems: number
+  totalItems: number
+}
+
+interface SyncPlan {
+  downloads: number
+  uploads: number
+}
+
+type SyncTarget = "same" | "local" | "remote" | "merge" | "conflict"
+
+interface FileUpload {
+  node: SyncNode
+  state: STATE_UPLOAD
+  blockIds: string[]
+}
+
+interface SyncMetrics {
+  startedAt: number
+  preparedBytes: number
+  downloadedBytes: number
+  uploadedBytes: number
+  reusedUploadBytes: number
+}
+
+class SlotPool {
+	private active = 0;
+	private readonly waiters: Array<(release: () => void) => void> = [];
+
+	constructor(private readonly limit: number) {}
+
+	async acquire(): Promise<() => void> {
+		if (this.active < this.limit) {
+			this.active++;
+			return this.createRelease();
+		}
+		return await new Promise<() => void>(resolve => this.waiters.push(resolve));
+	}
+
+	private createRelease(): () => void {
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			this.active--;
+			const waiter = this.waiters.shift();
+			if (waiter) {
+				this.active++;
+				waiter(this.createRelease());
+			}
+		};
+	}
+}
+
+class UploadSlotPool {
+	private active = 0;
+	private failed = false;
+	private failure: unknown;
+	private readonly waiters: Array<{ resolve: (release: () => void) => void, reject: (error: unknown) => void }> = [];
+
+	constructor(private readonly limit: number) {}
+
+	async acquire(): Promise<() => void> {
+		if (this.failed) throw this.failure;
+		if (this.active < this.limit) {
+			this.active++;
+			return this.createRelease();
+		}
+		return await new Promise<() => void>((resolve, reject) => this.waiters.push({ resolve, reject }));
+	}
+
+	fail(error: unknown): void {
+		if (this.failed) return;
+		this.failed = true;
+		this.failure = error;
+		for (const waiter of this.waiters.splice(0)) waiter.reject(error);
+	}
+
+	private createRelease(): () => void {
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			this.active--;
+			if (this.failed) return;
+			const waiter = this.waiters.shift();
+			if (waiter) {
+				this.active++;
+				waiter.resolve(this.createRelease());
+			}
+		};
+	}
 }
 
 export interface SYNC_STOP {
   type: "stop"
-  message?: "error" | "user"
+  message?: "error" | "user" | "repository-unavailable"
+  error?: string
 }
 
 export type SyncStatus = SYNC_IDLE | SYNC_BUSY | SYNC_STOP
 
 export class SyncController {
-	private ignore: {
-    accepts: (input: string) => boolean
-    denies: (input: string) => boolean
-    maybe: (input: string) => boolean
-  };
+	private static readonly LARGE_FILE_WARNING_BYTES = 50 * 1024 * 1024;
+	private static readonly DESKTOP_BLOCK_UPLOAD_CONCURRENCY = 4;
+	private static readonly MOBILE_BLOCK_UPLOAD_CONCURRENCY = 2;
+	private static readonly DESKTOP_FILE_PREPARATION_CONCURRENCY = 4;
+	private static readonly DESKTOP_DOWNLOAD_PREFETCH = 4;
+	private static readonly MOBILE_DOWNLOAD_PREFETCH = 2;
+	private static readonly BLOCK_CHECK_BATCH_SIZE = 1000;
+	private static readonly BLOCK_CHECK_CONCURRENCY = 4;
+	private static readonly FS_UPLOAD_BATCH_SIZE = 100;
+	private static readonly FS_OPERATION_CONCURRENCY = 4;
+	private static readonly DESKTOP_PREPARED_BLOCK_CACHE_BYTES = 32 * 1024 * 1024;
+	private static readonly OBJECT_UPLOAD_ATTEMPTS = 2;
+	private fileIoTail: Promise<void> = Promise.resolve();
+	private readonly filePreparationPool = new SlotPool(Platform.isMobile
+		? 1
+		: SyncController.DESKTOP_FILE_PREPARATION_CONCURRENCY);
+	private readonly warnedLargeMobileFiles = new Set<string>();
+	private readonly localStatCache = new Map<string, Promise<Stat | null>>();
+	private readonly localListCache = new Map<string, Promise<string[]>>();
+	private readonly preparedBlocks = new Map<string, ArrayBuffer>();
+	private preparedBlockBytes = 0;
+	private preparedBlockCacheEnabled = false;
+	private syncMetrics: SyncMetrics | null = null;
+
+	private ignore: IgnoreList = compileIgnoreList("");
+	private ignoreFileBootstrapped = false;
+	private progressCounts: { downloads: number, uploadsPrepared: number, uploads: number, plan: SyncPlan } | null = null;
+	private readonly directoryFsCache = new Map<string, DirSeafFs | null>();
 
 	private nodeRoot: SyncNode;
 
 	public constructor (
     private readonly adapter: DataAdapter,
-    private readonly settings: SeafileSettings) {
-		this.setIgnorePattern(settings.ignore);
+	private readonly settings: SeafileSettings) {}
+
+	private normalizePath(path: string): string {
+		while (path.startsWith("/")) path = path.slice(1);
+		while (path.endsWith("/")) path = path.slice(0, -1);
+		return path;
 	}
 
-	public setIgnorePattern (pattern: string) {
-		this.ignore = IgnoreParser.compile(DEFAULT_IGNORE + "\n" + pattern);
+	private async getLocalStat(path: string): Promise<Stat | null> {
+		const key = this.normalizePath(path);
+		let result = this.localStatCache.get(key);
+		if (!result) {
+			result = utils.fastStat(path);
+			this.localStatCache.set(key, result);
+		}
+		return await result;
+	}
+
+	private async getLocalList(path: string): Promise<string[]> {
+		const key = this.normalizePath(path);
+		let result = this.localListCache.get(key);
+		if (!result) {
+			result = utils.fastList(path);
+			this.localListCache.set(key, result);
+		}
+		return await result;
+	}
+
+	private clearLocalSnapshot(): void {
+		this.localStatCache.clear();
+		this.localListCache.clear();
+	}
+
+	private cachePreparedBlock(id: string, data: ArrayBuffer): void {
+		if (!this.preparedBlockCacheEnabled || Platform.isMobile || this.preparedBlocks.has(id)) return;
+		if (this.preparedBlockBytes + data.byteLength > SyncController.DESKTOP_PREPARED_BLOCK_CACHE_BYTES) return;
+		this.preparedBlocks.set(id, data);
+		this.preparedBlockBytes += data.byteLength;
+	}
+
+	private takePreparedBlock(id: string): ArrayBuffer | undefined {
+		const data = this.preparedBlocks.get(id);
+		if (!data) return undefined;
+		this.preparedBlocks.delete(id);
+		this.preparedBlockBytes -= data.byteLength;
+		return data;
+	}
+
+	private retainPreparedBlocks(ids: ReadonlySet<string>): void {
+		for (const [id, data] of this.preparedBlocks) {
+			if (ids.has(id)) continue;
+			this.preparedBlocks.delete(id);
+			this.preparedBlockBytes -= data.byteLength;
+		}
+	}
+
+	private clearPreparedBlocks(): void {
+		this.preparedBlocks.clear();
+		this.preparedBlockBytes = 0;
+	}
+
+	private async measurePhase<T>(name: string, task: () => Promise<T>): Promise<T> {
+		if (!this.settings.devMode) return await task();
+		const startedAt = Date.now();
+		try {
+			return await task();
+		} finally {
+			debug.log(`[performance] ${name}: ${Date.now() - startedAt} ms`);
+		}
+	}
+
+	private formatMetricBytes(bytes: number): string {
+		return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+	}
+
+	private finishMetrics(): void {
+		const metrics = this.syncMetrics;
+		this.syncMetrics = null;
+		if (!metrics) return;
+		const elapsedMs = Math.max(1, Date.now() - metrics.startedAt);
+		const transferredBytes = metrics.downloadedBytes + metrics.uploadedBytes;
+		const mibPerSecond = transferredBytes / (1024 * 1024) / (elapsedMs / 1000);
+		debug.log(
+			`[performance] total: ${elapsedMs} ms; prepared ${this.formatMetricBytes(metrics.preparedBytes)}; `
+			+ `downloaded ${this.formatMetricBytes(metrics.downloadedBytes)}; uploaded ${this.formatMetricBytes(metrics.uploadedBytes)}; `
+			+ `reused ${this.formatMetricBytes(metrics.reusedUploadBytes)}; transfer ${mibPerSecond.toFixed(1)} MB/s`
+		);
+	}
+
+	private isInternalPath(path: string): boolean {
+		const normalized = this.normalizePath(path);
+		return normalized === PLUGIN_DIR || normalized.startsWith(PLUGIN_DIR + "/");
+	}
+
+	public isPathIgnored(path: string, isDirectory = false): boolean {
+		return this.isInternalPath(path) || this.ignore.denies(path, isDirectory);
+	}
+
+	public async readIgnoreFile(): Promise<string> {
+		if (await this.adapter.exists(SEAFILE_IGNORE_FILE)) return await this.adapter.read(SEAFILE_IGNORE_FILE);
+		return DEFAULT_SEAFILE_IGNORE;
+	}
+
+	public async reloadIgnoreFile(): Promise<void> {
+		this.ignore = compileIgnoreList(await this.readIgnoreFile());
+	}
+
+	private async storeIgnoreFile(contents: string, mtime?: number): Promise<void> {
+		this.ignoreChange.add("/" + SEAFILE_IGNORE_FILE);
+		try {
+			await this.adapter.write(SEAFILE_IGNORE_FILE, contents, mtime === undefined ? undefined : { mtime });
+		} finally {
+			this.ignoreChange.delete("/" + SEAFILE_IGNORE_FILE);
+		}
+		this.ignore = compileIgnoreList(contents);
+		this.nodeRoot?.setDirty("/" + SEAFILE_IGNORE_FILE);
+	}
+
+	public async writeIgnoreFile(contents: string): Promise<void> {
+		await this.storeIgnoreFile(contents);
+	}
+
+	private async readRemoteFile(remote: FileSeafDirent): Promise<string> {
+		const [, rawFs] = await server.getFs(remote.id);
+		if (!rawFs || rawFs.type !== TYPE_FILE || !("block_ids" in rawFs) || rawFs.size !== remote.size) {
+			throw new Error(`Remote file metadata failed verification for '${SEAFILE_IGNORE_FILE}'.`);
+		}
+		const bytes = new Uint8Array(remote.size);
+		let offset = 0;
+		for (const blockId of rawFs.block_ids) {
+			const block = new Uint8Array(await server.getBlock(blockId));
+			if (offset + block.byteLength > bytes.byteLength) throw new Error("Remote ignore file exceeds its declared size.");
+			bytes.set(block, offset);
+			offset += block.byteLength;
+		}
+		if (offset !== bytes.byteLength) throw new Error("Remote ignore file does not match its declared size.");
+		return new TextDecoder().decode(bytes);
+	}
+
+	private async getDirectoryFs(id: string): Promise<DirSeafFs | null> {
+		if (this.directoryFsCache.has(id)) return this.directoryFsCache.get(id) ?? null;
+		const [, rawFs] = await server.getFs(id);
+		const fs = rawFs as DirSeafFs | null;
+		this.directoryFsCache.set(id, fs);
+		return fs;
+	}
+
+	private async bootstrapIgnoreFile(remoteRoot: DirSeafDirent): Promise<void> {
+		if (this.ignoreFileBootstrapped) return;
+		const rawRootFs = await this.getDirectoryFs(remoteRoot.id);
+		const remoteIgnore = rawRootFs && rawRootFs.type === 3 && "dirents" in rawRootFs
+			? rawRootFs.dirents.find(entry => entry.name === SEAFILE_IGNORE_FILE && entry.mode === MODE_FILE) as FileSeafDirent | undefined
+			: undefined;
+		const localExists = await this.adapter.exists(SEAFILE_IGNORE_FILE);
+		const localContents = localExists ? await this.adapter.read(SEAFILE_IGNORE_FILE) : "";
+		const remoteContents = remoteIgnore ? await this.readRemoteFile(remoteIgnore) : "";
+
+		if (!localExists) {
+			await this.storeIgnoreFile(
+				remoteIgnore ? remoteContents : DEFAULT_SEAFILE_IGNORE,
+				remoteIgnore ? remoteIgnore.mtime * 1000 : undefined
+			);
+		}
+		// When both copies differ, the union is deliberately conservative for
+		// this first traversal. Normal conflict handling then resolves the file.
+		this.ignore = compileIgnoreList([localContents, remoteContents, !localExists && !remoteIgnore ? DEFAULT_SEAFILE_IGNORE : ""].filter(Boolean).join("\n"));
+		this.ignoreFileBootstrapped = true;
+	}
+
+	// Recursive pull walks siblings concurrently. Serialize the expensive file
+	// bodies so a large directory cannot place several complete mobile files (or
+	// many desktop block buffers) in memory at once.
+	private async withFileIoSlot<T> (task: () => Promise<T>): Promise<T> {
+		const previous = this.fileIoTail;
+		let release = (): void => {};
+		this.fileIoTail = new Promise<void>(resolve => { release = resolve; });
+		await previous;
+		try {
+			return await task();
+		} finally {
+			release();
+		}
+	}
+
+	private async withFilePreparationSlot<T> (task: () => Promise<T>): Promise<T> {
+		const release = await this.filePreparationPool.acquire();
+		try {
+			return await task();
+		} finally {
+			release();
+		}
+	}
+
+	private async assertFileUnchanged (path: string, expected: { size: number, mtime: number }): Promise<void> {
+		const current = await utils.fastStat(path);
+		if (!current || current.type !== "file" || current.size !== expected.size || current.mtime !== expected.mtime) {
+			throw new Error(`File '${path}' changed while it was being synchronized. It will be retried on the next sync.`);
+		}
+	}
+
+	private async *readFileBlocks (
+		path: string,
+		expected: { size: number, mtime: number },
+		indices?: ReadonlySet<number>
+	): AsyncGenerator<{ index: number, data: ArrayBuffer }> {
+		await this.assertFileUnchanged(path, expected);
+		const blockCount = Math.ceil(expected.size / utils.SEAFILE_BLOCK_SIZE);
+
+		if (Platform.isDesktop && this.adapter instanceof FileSystemAdapter) {
+			// Obsidian loads desktop plugins as CommonJS. Keeping this as a native
+			// dynamic import leaves `import("fs/promises")` in the bundle, which its
+			// plugin loader cannot resolve. A conditional require uses the loader's
+			// existing Node integration and remains unexecuted on mobile.
+			const { open } = require("fs/promises") as typeof import("fs/promises");
+			const handle = await open(this.adapter.getFullPath(path), "r");
+			try {
+				for (let index = 0; index < blockCount; index++) {
+					if (indices && !indices.has(index)) continue;
+					const offset = index * utils.SEAFILE_BLOCK_SIZE;
+					const length = Math.min(utils.SEAFILE_BLOCK_SIZE, expected.size - offset);
+					const bytes = new Uint8Array(length);
+					let bytesRead = 0;
+					while (bytesRead < length) {
+						const result = await handle.read(bytes, bytesRead, length - bytesRead, offset + bytesRead);
+						if (result.bytesRead === 0) {
+							throw new Error(`File '${path}' ended while it was being synchronized.`);
+						}
+						bytesRead += result.bytesRead;
+					}
+					yield { index, data: bytes.buffer };
+				}
+			} finally {
+				await handle.close();
+			}
+		} else {
+			if (Platform.isMobile && expected.size > SyncController.LARGE_FILE_WARNING_BYTES && !this.warnedLargeMobileFiles.has(path)) {
+				this.warnedLargeMobileFiles.add(path);
+				debug.warn(`File '${path}' is larger than 50 MB. Mobile must temporarily read the complete file into memory.`);
+				new Notice(`Seafile: '${Path.basename(path)}' is larger than 50 MB. Mobile sync may use significant memory.`, 8000);
+			}
+			const buffer = await this.adapter.readBinary(path);
+			if (buffer.byteLength !== expected.size) {
+				throw new Error(`File '${path}' changed while it was being synchronized.`);
+			}
+			for (let index = 0; index < blockCount; index++) {
+				if (indices && !indices.has(index)) continue;
+				const offset = index * utils.SEAFILE_BLOCK_SIZE;
+				yield { index, data: buffer.slice(offset, Math.min(offset + utils.SEAFILE_BLOCK_SIZE, expected.size)) };
+			}
+		}
+
+		await this.assertFileUnchanged(path, expected);
 	}
 
 	// Load sync data
 	async init () {
+		await this.recoverInterruptedDownload();
 		SyncNode.onStateChanged = n => { this.raiseNodeStateChanged(n); };
+		SyncNode.onStatesChanged = nodes => { this.raiseNodeStatesChanged(nodes); };
 		this.nodeRoot = await SyncNode.load();
 
 		// Obsidian's adapter.append() throws ENOENT if the file doesn't exist,
@@ -72,54 +450,286 @@ export class SyncController {
 		}
 	}
 
-	async downloadFile (path: string, fsId: string, mtime: number) {
-		this.ignoreChange.add(path);
+	/**
+	 * Forget the remote-specific baseline while preserving every vault file.
+	 * This is used when replacing a repository that can no longer be reached.
+	 * The next initial sync will merge the local vault with the selected
+	 * repository as a fresh pairing.
+	 */
+	async resetForRepositoryChange(): Promise<void> {
+		await this.stopSyncAsync();
+		await this.recoverInterruptedDownload();
+
+		for (const path of [SYNC_DLOG_PATH, SYNC_DATA_PATH, HEAD_COMMIT_PATH, DOWNLOAD_JOURNAL_PATH]) {
+			if (await this.adapter.exists(path)) await this.adapter.remove(path);
+		}
+
+		this.localHead = undefined;
+		this.ignoreFileBootstrapped = false;
+		this.consecutiveFailures = 0;
+		this.syncRequested = false;
+		this.clearLocalSnapshot();
+		this.clearPreparedBlocks();
+		await this.init();
+	}
+
+	private async recoverInterruptedDownload(): Promise<void> {
+		let journal: { path: string, tempPath: string, backupPath: string };
 		try {
-			mtime = mtime * 1000;
-			await this.adapter.write(path, "", { mtime });
+			journal = JSON.parse(await this.adapter.read(DOWNLOAD_JOURNAL_PATH)) as typeof journal;
+			if (!journal.path || !journal.tempPath || !journal.backupPath) return;
+		} catch {
+			return;
+		}
 
-			if (fsId == ZeroFs) {
-				return;
+		if (await this.adapter.exists(journal.tempPath)) await this.adapter.remove(journal.tempPath);
+		if (await this.adapter.exists(journal.backupPath)) {
+			if (await this.adapter.exists(journal.path)) {
+				await this.adapter.remove(journal.backupPath);
+			} else {
+				await this.adapter.rename(journal.backupPath, journal.path);
 			}
+		}
+		await this.adapter.write(DOWNLOAD_JOURNAL_PATH, "");
+	}
 
-			let nativePath;
-			if (Platform.isMobile) {
-				nativePath = (this.adapter as MobileDataAdapter).getNativePath(path);
-			}
-
-			const [, fs] = await server.getFs(fsId);
-			for (const blockId of (fs as FileSeafFs).block_ids) {
-				const block = await server.getBlock(blockId);
-				if (Platform.isDesktop) {
-					await this.adapter.append(path, new DataView(block) as unknown as string, { mtime });
-				} else {
-					// Hacky way to get the filesystem plugin to append to file when mobile
-					const encoded = await utils.arrayBufferToBase64(block);
-					const capacitor = window.top as unknown as {
-						Capacitor: { Plugins: { Filesystem: { appendFile(options: { path: string; data: string }): Promise<void> } } }
-					};
-					// nativePath is intentionally passed through unchanged to preserve
-					// existing runtime behavior (it is not awaited here).
-					await capacitor.Capacitor.Plugins.Filesystem.appendFile({ path: nativePath as unknown as string, data: encoded });
-				}
-			}
-
-			if (Platform.isMobile) {
-				await this.adapter.append(path, "", { mtime }); // Set mtime
-			}
-		} finally {
-			this.ignoreChange.delete(path);
+	private async unusedSiblingPath(path: string, marker: string): Promise<string> {
+		const parent = Path.dirname(path);
+		const name = Path.basename(path);
+		for (let suffix = 0; ; suffix++) {
+			const candidateName = `.${name}.${marker}${suffix ? `-${suffix}` : ""}`;
+			const candidate = Path.join(parent, candidateName);
+			if (!await this.adapter.exists(candidate)) return candidate;
 		}
 	}
 
+	private async conflictPath(path: string): Promise<string> {
+		const account = this.settings.account.replace(/[\\/:*?"<>|]/g, "_") || "unknown";
+		const timestamp = new Date().toISOString().replace("T", "-").slice(0, 19).replace(/:/g, "-");
+		const base = `${path} (SFConflict ${account} ${timestamp})`;
+		for (let suffix = 0; ; suffix++) {
+			const candidate = suffix ? `${base}-${suffix}` : base;
+			if (!await this.adapter.exists(candidate)) return candidate;
+		}
+	}
+
+	private async preserveLocalConflict(changes: NodeChange[], path: string, node: SyncNode): Promise<void> {
+		if (!node.parent) throw new Error("Cannot preserve a conflict at the vault root.");
+		const conflictPath = await this.conflictPath(path);
+		this.ignoreChange.add(path);
+		this.ignoreChange.add(conflictPath);
+		try {
+			await this.adapter.rename(path, conflictPath);
+		} finally {
+			this.ignoreChange.delete(path);
+			this.ignoreChange.delete(conflictPath);
+		}
+
+		const conflictNode = node.parent.createChild(Path.basename(conflictPath));
+		await this.pull(changes, conflictPath, conflictNode, undefined);
+	}
+
+	async downloadFile (path: string, fsId: string, mtime: number, expectedSize: number, onProgress?: (completedBytes: number) => void) {
+		return await this.withFileIoSlot(async () => {
+			const tempPath = await this.unusedSiblingPath(path, "seafile-download");
+			const backupPath = await this.unusedSiblingPath(path, "seafile-backup");
+			let originalMoved = false;
+			let replacementInstalled = false;
+			let completedBytes = 0;
+			this.ignoreChange.add(path);
+			this.ignoreChange.add(tempPath);
+			this.ignoreChange.add(backupPath);
+			try {
+				onProgress?.(0);
+				await this.adapter.write(DOWNLOAD_JOURNAL_PATH, JSON.stringify({ path, tempPath, backupPath }));
+				mtime = mtime * 1000;
+				await this.adapter.write(tempPath, "", { mtime });
+
+				let nativePath;
+				if (Platform.isMobile) {
+					nativePath = (this.adapter as MobileDataAdapter).getNativePath(tempPath);
+				}
+
+				if (fsId != ZeroFs) {
+					const [, rawFs] = await server.getFs(fsId);
+					if (!rawFs || rawFs.type !== TYPE_FILE || !("block_ids" in rawFs) || rawFs.size !== expectedSize) {
+						throw new Error(`Remote file metadata failed verification for '${path}'.`);
+					}
+					const prefetch = Platform.isMobile
+						? SyncController.MOBILE_DOWNLOAD_PREFETCH
+						: SyncController.DESKTOP_DOWNLOAD_PREFETCH;
+					const pending = new Map<number, Promise<ArrayBuffer>>();
+					let nextToFetch = 0;
+					const fillWindow = (): void => {
+						while (nextToFetch < rawFs.block_ids.length && pending.size < prefetch) {
+							const index = nextToFetch++;
+							const request = server.getBlock(rawFs.block_ids[index]);
+							// A later block can reject before it is awaited in order.
+							// Attach a handler immediately to avoid an unhandled rejection.
+							void request.catch(() => {});
+							pending.set(index, request);
+						}
+					};
+					fillWindow();
+					for (let index = 0; index < rawFs.block_ids.length; index++) {
+						const block = await pending.get(index)!;
+						pending.delete(index);
+						fillWindow();
+						if (Platform.isDesktop) {
+							await this.adapter.append(tempPath, new DataView(block) as unknown as string, { mtime });
+						} else {
+							const encoded = await utils.arrayBufferToBase64(block);
+							const capacitor = window.top as unknown as {
+								Capacitor: { Plugins: { Filesystem: { appendFile(options: { path: string; data: string }): Promise<void> } } }
+							};
+							await capacitor.Capacitor.Plugins.Filesystem.appendFile({ path: nativePath as unknown as string, data: encoded });
+						}
+						completedBytes += block.byteLength;
+						if (this.syncMetrics) this.syncMetrics.downloadedBytes += block.byteLength;
+						onProgress?.(Math.min(expectedSize, completedBytes));
+					}
+				} else if (expectedSize !== 0) {
+					throw new Error(`Remote file metadata failed verification for '${path}'.`);
+				}
+
+				await this.adapter.append(tempPath, "", { mtime });
+				const completed = await this.adapter.stat(tempPath);
+				if (!completed || completed.type !== "file" || completed.size !== expectedSize) {
+					throw new Error(`Downloaded file size verification failed for '${path}'.`);
+				}
+
+				if (await this.adapter.exists(path)) {
+					await this.adapter.rename(path, backupPath);
+					originalMoved = true;
+				}
+				await this.adapter.rename(tempPath, path);
+				replacementInstalled = true;
+				await this.adapter.append(path, "", { mtime });
+				if (originalMoved && await this.adapter.exists(backupPath)) await this.adapter.remove(backupPath);
+				originalMoved = false;
+			} catch (error) {
+				if (await this.adapter.exists(tempPath)) await this.adapter.remove(tempPath);
+				if (replacementInstalled && await this.adapter.exists(path)) await this.adapter.remove(path);
+				if (originalMoved && await this.adapter.exists(backupPath)) {
+					if (!await this.adapter.exists(path)) await this.adapter.rename(backupPath, path);
+				}
+				throw error;
+			} finally {
+				await this.adapter.write(DOWNLOAD_JOURNAL_PATH, "");
+				this.ignoreChange.delete(path);
+				this.ignoreChange.delete(tempPath);
+				this.ignoreChange.delete(backupPath);
+			}
+		});
+	}
+
 	public onNodeStateChanged?: NodeStateChangedListener;
+	public onNodeStatesChanged?: (nodes: SyncNode[]) => void;
 	private raiseNodeStateChanged (node: SyncNode) {
 		this.onNodeStateChanged?.(node);
 	}
+	private raiseNodeStatesChanged (nodes: SyncNode[]) {
+		if (this.onNodeStatesChanged) this.onNodeStatesChanged(nodes);
+		else for (const node of nodes) this.raiseNodeStateChanged(node);
+	}
+
+	private reportProgress(progress: SyncProgress): void {
+		if (this.status.type === "busy") this.status.progress = progress;
+	}
+
+	private determineTarget(local: Stat | null, remote: SeafDirent | undefined, node: SyncNode | undefined): SyncTarget {
+		if (
+			(!local && !remote) ||
+			(node?.prev && remote && !node.prevDirty && node.prev.id === remote.id) ||
+			(local && remote && Math.floor(local.mtime / 1000) === remote.mtime && local.type === "file" && remote.mode === MODE_FILE && local.size === remote.size)
+		) return "same";
+
+		if (
+			(!remote && !node?.prev) ||
+			(node?.prev && remote && node.prev.id === remote.id)
+		) return "local";
+
+		if (
+			(!node?.prevDirty) ||
+			(!local && !node?.prev) ||
+			(node?.prev?.mode === MODE_FILE && local?.type === "file" && node.prev.mtime === Math.floor(local.mtime / 1000) && node.prev.size === local.size)
+		) return "remote";
+
+		if (local?.type !== "file" && remote?.mode !== MODE_FILE) return "merge";
+		return "conflict";
+	}
+
+	private async countLocalUploadFiles(path: string): Promise<number> {
+		if (this.isInternalPath(path)) return 0;
+		const local = await this.getLocalStat(path);
+		if (!local || this.ignore.denies(path, local.type === "folder")) return 0;
+		if (local.type === "file") return 1;
+		const counts = await Promise.all((await this.getLocalList(path)).map(async name => await this.countLocalUploadFiles(`${path}/${name}`)));
+		return counts.reduce((total, count) => total + count, 0);
+	}
+
+	private async planSync(path: string, node: SyncNode | undefined, remote?: SeafDirent): Promise<SyncPlan> {
+		const plan: SyncPlan = { downloads: 0, uploads: 0 };
+		if (this.isInternalPath(path)) return plan;
+
+		const local = await this.getLocalStat(path);
+		const isDirectory = local?.type === "folder" || remote?.mode === MODE_DIR || node?.prev?.mode === MODE_DIR;
+		const ignored = this.ignore.denies(path, isDirectory);
+		if (ignored && !remote && !node?.prev) return plan;
+		if (ignored && node?.prev && remote && node.prev.id === remote.id) return plan;
+
+		let target = this.determineTarget(local, remote, node);
+		if (target === "same") return plan;
+		if (target === "conflict") {
+			if (local && !remote) target = "local";
+			else if (!local && remote) target = "remote";
+			else {
+				// The local side will be preserved as a conflict copy and uploaded,
+				// while the remote side is downloaded at the original path.
+				if (local?.type === "file") plan.uploads++;
+				else if (local?.type === "folder") plan.uploads += await this.countLocalUploadFiles(path);
+				target = "remote";
+			}
+		}
+
+		const names = new Set<string>();
+		const remoteChildren: Record<string, SeafDirent> = {};
+		let recurse = false;
+		if ((target === "local" || target === "merge") && local?.type === "folder") {
+			recurse = true;
+			for (const name of await this.getLocalList(path)) names.add(name);
+		}
+		if ((target === "remote" || target === "merge") && remote?.mode === MODE_DIR) {
+			recurse = true;
+			const fs = await this.getDirectoryFs(remote.id);
+			for (const child of fs?.dirents ?? []) {
+				remoteChildren[child.name] = child;
+				names.add(child.name);
+			}
+		}
+		const nodeChildren = node?.getChildren() ?? {};
+		if (recurse) for (const name of Object.keys(nodeChildren)) names.add(name);
+		if (recurse) {
+			const children = await Promise.all(Array.from(names, async name => {
+				const childNode = nodeChildren[name];
+				const remoteChild = target === "local" ? childNode?.prev : remoteChildren[name];
+				return await this.planSync(`${path}/${name}`, childNode, remoteChild);
+			}));
+			for (const child of children) {
+				plan.downloads += child.downloads;
+				plan.uploads += child.uploads;
+			}
+		}
+
+		if (target === "remote" && remote?.mode === MODE_FILE) plan.downloads++;
+		if (target === "local" && local?.type === "file") plan.uploads++;
+		return plan;
+	}
 
 	public async pull (changes: NodeChange[], path: string, node: SyncNode, remote?: SeafDirent) {
-		// Step 0. Check ignore pattern
-		if (this.ignore.denies(path)) {
+		// Operational plugin state is never part of the library, even if a
+		// malformed or remotely edited ignore file omits the recommended rule.
+		if (this.isInternalPath(path)) {
 			if (remote) {
 				await node.setPrevAsync(remote, false);
 				node.state = { type: "sync" };
@@ -131,19 +741,25 @@ export class SyncController {
 		}
 
 		// Step 1. Check file status: same, local, remote, merge, conflict
-		const local = await utils.fastStat(path);
+		let local = await this.getLocalStat(path);
+		const isDirectory = local?.type === "folder" || remote?.mode === MODE_DIR || node.prev?.mode === MODE_DIR;
+		const ignored = this.ignore.denies(path, isDirectory);
 
-		let target = null;
-		// Same:
-		// - both are null
-		// - prev not dirty, prev id == remote id
-		// - mtime is same, type is file, size is same
-		if (
-			(!local && !remote) ||
-            (node?.prev && remote && !node.prevDirty && node.prev.id === remote.id) ||
-            (local && remote && Math.floor(local.mtime / 1000) === remote.mtime && local.type == "file" && remote.mode == MODE_FILE && local.size === remote.size)
-		) {
-			target = "same";
+		// Seafile ignore rules are upload-side exclusions. New local entries are
+		// not uploaded, while entries already present on the server may still be
+		// downloaded. If the server version is unchanged, ignore local edits.
+		if (ignored && !remote && !node.prev) {
+			await node.delete();
+			return;
+		}
+		if (ignored && node.prev && remote && node.prev.id === remote.id) {
+			await node.setPrevAsync(remote, false);
+			node.state = { type: "sync" };
+			return;
+		}
+
+		let target = this.determineTarget(local, remote, node);
+		if (target === "same") {
 			if (local || remote) {
 				await node.setPrevAsync(remote, false);
 				node.state = { type: "sync" };
@@ -152,51 +768,15 @@ export class SyncController {
 			}
 			return;
 		}
-		// Local:
-		// prev and remote is null
-		// prev and remote have same id
-		else if (
-			(!remote && !node.prev) ||
-            (node.prev && remote && node.prev.id === remote.id)
-		) {
-			target = "local";
-		}
-
-		// Remote: Local matches prev
-		// prev is not dirty
-		// prev and local is null
-		// prev and local are files, prev mtime and size matches local
-		else if (
-			(!node.prevDirty) ||
-            (!local && !node.prev) ||
-            (node.prev?.mode == MODE_FILE && local?.type == "file" && node.prev.mtime === Math.floor(local.mtime / 1000) && node.prev.size === local.size)
-		) {
-			target = "remote";
-		}
-
-		// Merge:
-		// Neither is a file
-		else if (local?.type !== "file" && remote?.mode !== MODE_FILE) {
-			target = "merge";
-		}
-		// Conflict:
-		// One is a file
-		else {
-			target = "conflict";
-		}
-
 		// Step 2. Resolve conflicts
 		if (target == "conflict") {
 			// Only one side exists
 			if (local && !remote) target = "local";
 			else if (!local && remote) target = "remote";
 			else {
-				// Take the newer one
-				if (Math.floor(local!.mtime / 1000) > remote!.mtime) target = "local";
-				else {
-					target = "remote";
-					if (local!.type == "file") { await this.adapter.remove(path); } else { await this.adapter.rmdir(path, true); }
-				}
+				await this.preserveLocalConflict(changes, path, node);
+				local = null;
+				target = "remote";
 			}
 		}
 
@@ -206,15 +786,14 @@ export class SyncController {
 		const newRemote: Record<string, SeafDirent> = {};
 
 		if ((target == "local" || target == "merge") && local && local.type == "folder") {
-			const list = await utils.fastList(path);
+			const list = await this.getLocalList(path);
 			if (!newChildrenNames) newChildrenNames = new Set();
 			for (const name of list) {
 				newChildrenNames.add(name);
 			}
 		}
 		if ((target == "remote" || target == "merge") && remote && remote.mode == MODE_DIR) {
-			const [, rawFs] = await server.getFs(remote.id);
-			const fs = rawFs as DirSeafFs | null;
+			const fs = await this.getDirectoryFs(remote.id);
 			if (!newChildrenNames) newChildrenNames = new Set();
 			if (fs) {
 				for (const dirent of fs.dirents) {
@@ -289,7 +868,17 @@ export class SyncController {
 			} else {
 				if (remote.mode == MODE_FILE) {
 					node.state = { type: "download", param: 0 };
-					await this.downloadFile(path, remote.id, remote.mtime);
+					await this.downloadFile(path, remote.id, remote.mtime, remote.size, completedBytes => {
+						const progress = remote.size === 0 ? 1 : completedBytes / remote.size;
+						if (node.state.type === "download") node.state.param = progress;
+					});
+					if (this.progressCounts) {
+						this.progressCounts.downloads++;
+						this.reportProgress({
+							operation: "download", completedFiles: this.progressCounts.downloads,
+							totalFiles: Math.max(this.progressCounts.plan.downloads, this.progressCounts.downloads)
+						});
+					}
 					await node.setPrevAsync(remote, false);
 					node.state = { type: "sync" };
 					return;
@@ -310,9 +899,16 @@ export class SyncController {
 				await node.delete();
 				return;
 			} else if (local.type === "file") {
-				const [dirent, fs, blocks] = await this.computeFileDirent(path, this.settings.account);
+				const [dirent, fs, source] = await this.computeFileDirent(path, this.settings.account);
+				if (this.progressCounts) {
+					this.progressCounts.uploadsPrepared++;
+					this.reportProgress({
+						operation: "prepare", completedFiles: this.progressCounts.uploadsPrepared,
+						totalFiles: Math.max(this.progressCounts.plan.uploads, this.progressCounts.uploadsPrepared)
+					});
+				}
 				node.setNext(dirent, false);
-				node.state = { type: "upload", param: { progress: 0, fs, blocks } };
+				node.state = { type: "upload", param: { progress: 0, fs, source } };
 				changes.push({ node, type: remote ? "modify" : "add" });
 				return;
 			}
@@ -340,24 +936,30 @@ export class SyncController {
 		}
 	}
 
-	async computeFileDirent (path: string, modifier: string): Promise<[FileSeafDirent, SeafFs | null, Record<string, ArrayBuffer>]> {
+	async computeFileDirent (path: string, modifier: string): Promise<[FileSeafDirent, SeafFs | null, { path: string, size: number, mtime: number }]> {
 		const stat = await utils.fastStat(path);
 		if (!stat) throw new Error("Cannot compute fs of non-existent file");
 
-		let blockBuffer: Record<string, ArrayBuffer> = {};
+		const source = { path, size: stat.size, mtime: stat.mtime };
 		let fsId: string, fs: SeafFs | null;
 
 		if (stat.size == 0) {
 			[fsId, fs] = [ZeroFs, null];
 		} else {
-			// to do: warn if file too large
-			const buffer = await this.adapter.readBinary(path);
-			blockBuffer = server.crypto
-				? await utils.computeBlocksEncrypted(buffer, (chunk) => server.crypto!.encryptBlock(chunk))
-				: await utils.computeBlocks(buffer);
+			const blockIds = await this.withFilePreparationSlot(async () => {
+				const ids: string[] = [];
+				for await (const { data } of this.readFileBlocks(path, source)) {
+					const wireData = server.crypto ? await server.crypto.encryptBlock(data) : data;
+					if (this.syncMetrics) this.syncMetrics.preparedBytes += wireData.byteLength;
+					const id = await utils.sha1(wireData);
+					ids.push(id);
+					this.cachePreparedBlock(id, wireData);
+				}
+				return ids;
+			});
 
 			fs = {
-				block_ids: Object.keys(blockBuffer),
+				block_ids: blockIds,
 				size: stat.size,
 				type: 1,
 				version: 1
@@ -374,7 +976,7 @@ export class SyncController {
 			size: stat.size
 		};
 
-		return [dirent, fs, blockBuffer];
+		return [dirent, fs, source];
 	}
 
 	async createDirFs (children: SeafDirent[]): Promise<[string, SeafFs | null]> {
@@ -422,33 +1024,279 @@ export class SyncController {
 		return [dirent, fs];
 	}
 
-	async computeBlocks (localPath: string): Promise<Record<string, ArrayBuffer>> {
-		const stat = await utils.fastStat(localPath);
-		if (!stat) throw new Error(`File '${localPath}' does not exist.`);
-		if (stat.type != "file") throw new Error(`Path '${localPath}' is not a file.`);
+	private async findMissingBlocks(
+		blockIds: string[],
+		onProgress?: (completedBlocks: number, totalBlocks: number) => void
+	): Promise<Set<string>> {
+		const missing = new Set<string>();
+		let nextOffset = 0;
+		let completed = 0;
+		onProgress?.(0, blockIds.length);
+		const worker = async (): Promise<void> => {
+			while (nextOffset < blockIds.length) {
+				const offset = nextOffset;
+				nextOffset += SyncController.BLOCK_CHECK_BATCH_SIZE;
+				const batch = blockIds.slice(offset, offset + SyncController.BLOCK_CHECK_BATCH_SIZE);
+				const availability = await server.checkBlocksList(batch);
+				for (const id of batch) {
+					const value = availability.get(id);
+					if (value === undefined) throw new Error(`Seafile returned no status for block '${id}'.`);
+					if (value) missing.add(id);
+				}
+				completed += batch.length;
+				onProgress?.(completed, blockIds.length);
+			}
+		};
+		const batchCount = Math.ceil(blockIds.length / SyncController.BLOCK_CHECK_BATCH_SIZE);
+		await Promise.all(Array.from(
+			{ length: Math.min(SyncController.BLOCK_CHECK_CONCURRENCY, batchCount) },
+			async () => await worker()
+		));
+		return missing;
+	}
 
-		if (stat.size === 0) {
-			return {};
+	private async findMissingFilesystemObjects(fsIds: string[]): Promise<Set<string>> {
+		const missing = new Set<string>();
+		let nextOffset = 0;
+		const worker = async (): Promise<void> => {
+			while (nextOffset < fsIds.length) {
+				const offset = nextOffset;
+				nextOffset += SyncController.BLOCK_CHECK_BATCH_SIZE;
+				const batch = fsIds.slice(offset, offset + SyncController.BLOCK_CHECK_BATCH_SIZE);
+				const availability = await server.checkFsList(batch);
+				for (const id of batch) {
+					const value = availability.get(id);
+					if (value === undefined) throw new Error(`Seafile returned no status for filesystem object '${id}'.`);
+					if (value) missing.add(id);
+				}
+			}
+		};
+		const batchCount = Math.ceil(fsIds.length / SyncController.BLOCK_CHECK_BATCH_SIZE);
+		await Promise.all(Array.from(
+			{ length: Math.min(SyncController.FS_OPERATION_CONCURRENCY, batchCount) },
+			async () => await worker()
+		));
+		return missing;
+	}
+
+	private async uploadBlockIndices (node: SyncNode, state: STATE_UPLOAD, blockIds: string[], missingIndices: ReadonlySet<number>, pool: UploadSlotPool): Promise<void> {
+		const source = state.param.source!;
+		let completed = 0;
+		const pending: Promise<void>[] = [];
+		const uncachedIndices = new Set<number>();
+		const cachedBlocks: Array<{ index: number, data: ArrayBuffer }> = [];
+		for (const index of missingIndices) {
+			const data = this.takePreparedBlock(blockIds[index]);
+			if (data) cachedBlocks.push({ index, data });
+			else uncachedIndices.add(index);
+		}
+		let blocks: AsyncIterator<{ index: number, data: ArrayBuffer }> | undefined;
+		const schedule = async (index: number, data: ArrayBuffer, prepared: boolean, reservedRelease?: () => void): Promise<void> => {
+			const release = reservedRelease ?? await pool.acquire();
+			const expectedId = blockIds[index];
+			const upload = (async () => {
+				const wireData = prepared
+					? data
+					: server.crypto ? await server.crypto.encryptBlock(data) : data;
+				if (!prepared) {
+					const actualId = await utils.sha1(wireData);
+					if (actualId !== expectedId) {
+						throw new Error(`File '${source.path}' changed while it was being synchronized. It will be retried on the next sync.`);
+					}
+				}
+				await server.uploadBlock(expectedId, wireData);
+				if (this.syncMetrics) {
+					this.syncMetrics.uploadedBytes += wireData.byteLength;
+					if (prepared) this.syncMetrics.reusedUploadBytes += wireData.byteLength;
+				}
+				completed++;
+				state.param.progress = completed / missingIndices.size;
+				this.raiseNodeStateChanged(node);
+			})().catch(error => {
+				pool.fail(error);
+				throw error;
+			}).finally(release);
+			// Attach a handler immediately; another producer may still be
+			// unwinding when this upload rejects.
+			void upload.catch(() => {});
+			pending.push(upload);
+		};
+		try {
+			if (cachedBlocks.length > 0) {
+				await this.assertFileUnchanged(source.path, source);
+				for (const block of cachedBlocks) await schedule(block.index, block.data, true);
+			}
+
+			blocks = this.readFileBlocks(source.path, source, uncachedIndices)[Symbol.asyncIterator]();
+			let scheduled = 0;
+			while (scheduled < uncachedIndices.size) {
+				const release = await pool.acquire();
+				let next: IteratorResult<{ index: number, data: ArrayBuffer }>;
+				try {
+					next = await blocks.next();
+				} catch (error) {
+					release();
+					pool.fail(error);
+					throw error;
+				}
+				if (next.done) {
+					release();
+					throw new Error(`File '${source.path}' ended while its blocks were being scheduled.`);
+				}
+
+				const { index, data } = next.value;
+				scheduled++;
+				await schedule(index, data, false, release);
+			}
+			// We know exactly how many selected blocks the generator must yield.
+			// Close it directly after the last one instead of waiting for another
+			// scarce upload slot merely to observe IteratorResult.done.
+			await blocks.return?.(undefined);
+			await Promise.all(pending);
+		} catch (error) {
+			pool.fail(error);
+			await Promise.allSettled(pending);
+			await blocks?.return?.(undefined);
+			throw error;
+		}
+	}
+
+	private reportUploadedFile(): void {
+		if (!this.progressCounts) return;
+		this.progressCounts.uploads++;
+		this.reportProgress({
+			operation: "upload", completedFiles: this.progressCounts.uploads,
+			totalFiles: this.progressCounts.plan.uploads
+		});
+	}
+
+	private async uploadMissingBlockRound(fileUploads: FileUpload[], missing: ReadonlySet<string>, reportFiles: boolean): Promise<void> {
+		const scheduledIds = new Set<string>();
+		const assignments = fileUploads.map(upload => {
+			const indices = new Set<number>();
+			for (let index = 0; index < upload.blockIds.length; index++) {
+				const id = upload.blockIds[index];
+				if (missing.has(id) && !scheduledIds.has(id)) {
+					indices.add(index);
+					scheduledIds.add(id);
+				}
+			}
+			return { upload, indices };
+		});
+		const pool = new UploadSlotPool(Platform.isMobile
+			? SyncController.MOBILE_BLOCK_UPLOAD_CONCURRENCY
+			: SyncController.DESKTOP_BLOCK_UPLOAD_CONCURRENCY);
+		const run = async ({ upload, indices }: typeof assignments[number]): Promise<void> => {
+			if (indices.size > 0) await this.uploadBlockIndices(upload.node, upload.state, upload.blockIds, indices, pool);
+			if (reportFiles) this.reportUploadedFile();
+		};
+
+		if (Platform.isMobile) {
+			// MobileDataAdapter.readBinary() materializes the complete file. Keep
+			// file bodies serial while still allowing two blocks from that file to
+			// be encrypted and uploaded concurrently.
+			for (const assignment of assignments) await run(assignment);
+		} else {
+			await Promise.all(assignments.map(run));
+		}
+	}
+
+	private async uploadFileObjects(fileUploads: FileUpload[]): Promise<void> {
+		const blockOwners = new Map<string, string>();
+		for (const upload of fileUploads) {
+			for (const id of upload.blockIds) {
+				if (!blockOwners.has(id)) blockOwners.set(id, upload.state.param.source!.path);
+			}
 		}
 
-		// if size > 50MB, warn user
-		if (stat.size > 50 * 1024 * 1024) {
-			debug.warn(`File '${localPath}' is larger than 50MB. This may take a while or even crash obsidian.`);
+		const blockIds = Array.from(blockOwners.keys());
+		let missing = blockIds.length === 0
+			? new Set<string>()
+			: await this.measurePhase("check upload blocks", async () => await this.findMissingBlocks(
+				blockIds,
+				(completedBlocks, totalBlocks) => {
+					this.reportProgress({ operation: "check-blocks", completedBlocks, totalBlocks });
+				}
+			));
+		this.retainPreparedBlocks(missing);
+		let reportedFiles = false;
+		for (let attempt = 0; missing.size > 0 && attempt < SyncController.OBJECT_UPLOAD_ATTEMPTS; attempt++) {
+			if (this.progressCounts) {
+				this.reportProgress({
+					operation: "upload",
+					completedFiles: this.progressCounts.uploads,
+					totalFiles: this.progressCounts.plan.uploads
+				});
+			}
+			await this.measurePhase(`upload block round ${attempt + 1}`, async () => {
+				await this.uploadMissingBlockRound(fileUploads, missing, !reportedFiles);
+			});
+			reportedFiles = true;
+			missing = await this.measurePhase(`verify block round ${attempt + 1}`, async () => await this.findMissingBlocks(
+				Array.from(missing),
+				(completedBlocks, totalBlocks) => {
+					this.reportProgress({ operation: "verify-blocks", completedBlocks, totalBlocks });
+				}
+			));
+		}
+		if (!reportedFiles) {
+			for (const _upload of fileUploads) this.reportUploadedFile();
+		}
+		if (missing.size > 0) {
+			const id = missing.values().next().value as string;
+			throw new Error(`Seafile did not store block '${id}' referenced by '${blockOwners.get(id)}'. The commit was not published.`);
 		}
 
-		const blocks: Record<string, ArrayBuffer> = {};
-		const buffer = await this.adapter.readBinary(localPath);
-		const blockSize = 8 * 1024 * 1024; // 8MB
-		const numBlocks = Math.ceil(stat.size / blockSize);
-		for (let i = 0; i < numBlocks; i++) {
-			const blockStart = i * blockSize;
-			const blockEnd = blockStart + blockSize;
-			const block = buffer.slice(blockStart, blockEnd);
-			const hash = await utils.sha1(block); // Ensure utils.sha1 can handle ArrayBuffer or adjust accordingly
-			blocks[hash] = block;
+		for (const upload of fileUploads) {
+			const source = upload.state.param.source!;
+			await this.assertFileUnchanged(source.path, source);
+			upload.state.param.progress = 1;
+			this.raiseNodeStateChanged(upload.node);
 		}
+		this.clearPreparedBlocks();
+	}
 
-		return blocks;
+	private async uploadFilesystemObjects(uploads: SyncNode[], onProgress?: (completed: number, total: number) => void): Promise<void> {
+		const objects = new Map<string, { fs: SeafFs, path: string }>();
+		for (const node of uploads) {
+			if (node.state.type === "upload" && node.state.param.fs && node.next) {
+				objects.set(node.next.id, { fs: node.state.param.fs, path: node.path });
+			}
+		}
+		const total = objects.size;
+		onProgress?.(0, total);
+
+		let missing = await this.findMissingFilesystemObjects(Array.from(objects.keys()));
+		const alreadyStored = total - missing.size;
+		let published = 0;
+		onProgress?.(alreadyStored, total);
+		for (let attempt = 0; missing.size > 0 && attempt < SyncController.OBJECT_UPLOAD_ATTEMPTS; attempt++) {
+			const items = Array.from(missing, id => [id, objects.get(id)!.fs] as [string, SeafFs]);
+			let nextOffset = 0;
+			const worker = async (): Promise<void> => {
+				while (nextOffset < items.length) {
+					const offset = nextOffset;
+					nextOffset += SyncController.FS_UPLOAD_BATCH_SIZE;
+					const batch = items.slice(offset, offset + SyncController.FS_UPLOAD_BATCH_SIZE);
+					await server.sendPackFs(batch);
+					if (attempt === 0) {
+						published += batch.length;
+						onProgress?.(Math.min(total, alreadyStored + published), total);
+					}
+				}
+			};
+			const batchCount = Math.ceil(items.length / SyncController.FS_UPLOAD_BATCH_SIZE);
+			await Promise.all(Array.from(
+				{ length: Math.min(SyncController.FS_OPERATION_CONCURRENCY, batchCount) },
+				async () => await worker()
+			));
+			missing = await this.findMissingFilesystemObjects(Array.from(missing));
+		}
+		if (missing.size > 0) {
+			const id = missing.values().next().value as string;
+			throw new Error(`Seafile did not store filesystem object '${id}' for '${objects.get(id)?.path}'. The commit was not published.`);
+		}
+		onProgress?.(total, total);
 	}
 
 	async push (nodeRoot: SyncNode, changes: NodeChange[], parentCommitId: string): Promise<string> {
@@ -458,22 +1306,28 @@ export class SyncController {
 		}
 
 		const uploads = changes.filter(change => change.type == "add" || change.type == "modify").map(change => change.node);
-		// Upload fs
-		await Promise.all(uploads.map(async (node) => {
-			if (node.state.type !== "upload" || !node.next) {
-				throw Error("Node is not in upload state or has no next");
+		const fileUploads: FileUpload[] = [];
+		for (const node of uploads) {
+			if (node.state.type !== "upload" || !node.next) throw Error("Node is not in upload state or has no next");
+			if (!node.state.param.source) continue;
+			const fs = node.state.param.fs;
+			if (fs && (fs.type !== TYPE_FILE || !("block_ids" in fs))) {
+				throw new Error(`File '${node.state.param.source.path}' has invalid filesystem metadata.`);
 			}
-
-			const uploadState: STATE_UPLOAD = node.state;
-			const param = uploadState.param;
-			if (param.blocks) {
-				const blocks: Record<string, ArrayBuffer> = param.blocks;
-				await Promise.all(Object.entries(blocks).map(async ([blockId, block]: [string, ArrayBuffer]) => {
-					if (await server.checkBlock(blockId)) { await server.sendBlock(blockId, block); }
-				}));
-			}
-			if (param.fs && await server.checkFs(node.next.id)) { await server.sendFs([node.next.id, param.fs]); }
-		}));
+			fileUploads.push({ node, state: node.state, blockIds: fs && "block_ids" in fs ? fs.block_ids : [] });
+		}
+		if (this.progressCounts) {
+			this.progressCounts.plan.uploads = fileUploads.length;
+			this.progressCounts.uploads = 0;
+			if (fileUploads.length > 0) this.reportProgress({ operation: "upload", completedFiles: 0, totalFiles: fileUploads.length });
+		}
+		await this.uploadFileObjects(fileUploads);
+		if (this.status.type === "busy") this.status.progress = undefined;
+		await this.measurePhase("publish filesystem objects", async () => {
+			await this.uploadFilesystemObjects(uploads, (completedItems, totalItems) => {
+				this.reportProgress({ operation: "publish-metadata", completedItems, totalItems });
+			});
+		});
 
 		// Create commit
 		const description = server.describeCommit({
@@ -485,14 +1339,29 @@ export class SyncController {
 			renamedFiles: [],
 			renamedDirectories: []
 		});
-		const commit = await server.createCommit(nodeRoot.next.id, description, parentCommitId);
-		await server.uploadCommit(commit);
-		await server.setHeadCommit(commit.commit_id);
+		this.reportProgress({ operation: "publish-commit", completedItems: 0, totalItems: 1 });
+		const commit = await this.measurePhase("publish commit", async () => {
+			const nextCommit = await server.createCommit(nodeRoot.next!.id, description, parentCommitId);
+			await server.uploadCommit(nextCommit);
+			await server.setHeadCommit(nextCommit.commit_id);
+			const publishedHead = await server.getHeadCommitId();
+			if (publishedHead !== nextCommit.commit_id) {
+				throw new Error(`Seafile HEAD verification failed: expected '${nextCommit.commit_id}', received '${publishedHead}'.`);
+			}
+			return nextCommit;
+		});
+		this.reportProgress({ operation: "publish-commit", completedItems: 1, totalItems: 1 });
 
-		// Update nodes
-		for (const node of uploads) {
-			await node.applyNext();
-		}
+		await this.measurePhase("save local sync state", async () => {
+			const totalItems = uploads.length;
+			this.reportProgress({ operation: "save-state", completedItems: 0, totalItems });
+			const reportInterval = Math.max(1, Math.ceil(totalItems / 100));
+			await SyncNode.applyNextBatch(uploads, completedItems => {
+				if (completedItems === totalItems || completedItems % reportInterval === 0) {
+					this.reportProgress({ operation: "save-state", completedItems, totalItems });
+				}
+			});
+		});
 
 		return commit.commit_id;
 	}
@@ -500,6 +1369,10 @@ export class SyncController {
 	private readonly ignoreChange = new Set<string>();
 	async notifyChange (path: string, type: "create" | "modify" | "delete") {
 		if (this.ignoreChange.has(path)) return;
+		if (this.normalizePath(path) === SEAFILE_IGNORE_FILE) {
+			const contents = type === "delete" ? "" : await this.adapter.read(SEAFILE_IGNORE_FILE);
+			this.ignore = compileIgnoreList(contents);
+		}
 
 		if (type == "create") {
 			if (this.nodeRoot.find(path)) return;
@@ -518,7 +1391,7 @@ export class SyncController {
 		this.nodeRoot.setDirty(path);
 	}
 
-	private localHead: string;
+	private localHead: string | undefined;
 	private async setLocalHeadAsync (commitId: string) {
 		if (this.localHead != commitId) {
 			this.localHead = commitId;
@@ -527,20 +1400,58 @@ export class SyncController {
 	}
 
 	async sync () {
+		if (this.localHead === undefined) throw new Error("Sync controller is not initialized.");
+		this.progressCounts = null;
+		this.directoryFsCache.clear();
+		this.clearLocalSnapshot();
+		this.clearPreparedBlocks();
+		this.syncMetrics = this.settings.devMode ? {
+			startedAt: Date.now(), preparedBytes: 0, downloadedBytes: 0, uploadedBytes: 0, reusedUploadBytes: 0
+		} : null;
 		this.status = { type: "busy", message: "fetch" };
 		const changes: NodeChange[] = [];
-		const remoteHead = await server.getHeadCommitId();
-		const remoteRoot = await server.getCommitRoot(remoteHead);
+		try {
+			const [remoteHead, remoteRoot] = await this.measurePhase("fetch remote metadata", async () => {
+				const head = await server.getHeadCommitId();
+				const root = await server.getCommitRoot(head);
+				await this.bootstrapIgnoreFile(root);
+				return [head, root] as const;
+			});
 
-		this.status.message = "download";
-		await this.pull(changes, "", this.nodeRoot, remoteRoot);
-		await this.setLocalHeadAsync(remoteHead);
+			this.status.progress = undefined;
+			this.status.message = "download";
+			const plan = await this.measurePhase("plan changes", async () => await this.planSync("", this.nodeRoot, remoteRoot));
+			this.progressCounts = { downloads: 0, uploadsPrepared: 0, uploads: 0, plan };
+			if (plan.downloads > 0) {
+				this.reportProgress({ operation: "download", completedFiles: 0, totalFiles: plan.downloads });
+			} else if (plan.uploads > 0) {
+				this.reportProgress({ operation: "prepare", completedFiles: 0, totalFiles: plan.uploads });
+			}
+			this.preparedBlockCacheEnabled = Platform.isDesktop;
 
-		this.status.message = "upload";
-		const newHead = await this.push(this.nodeRoot, changes, this.localHead);
-		await this.setLocalHeadAsync(newHead);
+			await this.measurePhase("reconcile files", async () => {
+				await this.pull(changes, "", this.nodeRoot, remoteRoot);
+			});
+			await this.setLocalHeadAsync(remoteHead);
 
-		if (SyncNode.dataLogCount > 100) { await SyncNode.save(this.nodeRoot); }
+			this.status.progress = undefined;
+			this.status.message = "upload";
+			const newHead = await this.measurePhase("push changes", async () => await this.push(this.nodeRoot, changes, this.localHead!));
+			await this.setLocalHeadAsync(newHead);
+
+			if (SyncNode.dataLogCount > 100) {
+				this.reportProgress({ operation: "compact-state", completedItems: 0, totalItems: 1 });
+				await this.measurePhase("compact local sync state", async () => { await SyncNode.save(this.nodeRoot); });
+				this.reportProgress({ operation: "compact-state", completedItems: 1, totalItems: 1 });
+			}
+		} finally {
+			this.progressCounts = null;
+			this.directoryFsCache.clear();
+			this.clearLocalSnapshot();
+			this.preparedBlockCacheEnabled = false;
+			this.clearPreparedBlocks();
+			this.finishMetrics();
+		}
 	}
 
 	private timeoutId: number;
@@ -550,23 +1461,33 @@ export class SyncController {
 	// click "resume" -- retry with backoff instead, and only give up for real
 	// after several failures in a row.
 	private consecutiveFailures = 0;
+	private syncRequested = false;
 	private static readonly MAX_CONSECUTIVE_FAILURES = 5;
 	private static readonly MAX_BACKOFF_MS = 5 * 60 * 1000;
 
 	private _status: SyncStatus = { type: "stop" };
+	private readonly statusListeners = new Set<(status: SyncStatus) => void>();
 	public get status () { return this._status; }
+	private emitStatus(status: SyncStatus): void {
+		for (const listener of this.statusListeners) listener(status);
+	}
 	private set status (value) {
 		this._status = new Proxy<SyncStatus>(value, {
 			set: (target, prop, value) => {
 				Reflect.set(target, prop, value);
-				this.onSyncStatusChanged?.(target);
+				this.emitStatus(target);
 				return true;
 			}
 		});
-		this.onSyncStatusChanged?.(value);
+		this.emitStatus(value);
 	}
 
-	public onSyncStatusChanged: ((status: SyncStatus) => void) | null = null;
+	public onRepositoryUnavailable: (() => void) | null = null;
+	public subscribeStatus(listener: (status: SyncStatus) => void): () => void {
+		this.statusListeners.add(listener);
+		listener(this.status);
+		return () => this.statusListeners.delete(listener);
+	}
 
 	startSync () {
 		if (this.status.type == "stop") {
@@ -583,24 +1504,41 @@ export class SyncController {
 		}
 	}
 
+	requestSync(): void {
+		if (this.status.type === "busy") {
+			this.syncRequested = true;
+			return;
+		}
+		if (this.status.type === "idle") this.startSync();
+	}
+
 	async syncCycle () {
 		if (this.status.type == "idle") {
 			this.status = { type: "busy" };
 
 			debug.time("Sync");
 			let failed = false;
+			let failureMessage: string | undefined;
 			try {
 				await this.sync();
 				this.consecutiveFailures = 0;
 			} catch (e) {
 				failed = true;
-				this.consecutiveFailures++;
+				failureMessage = e instanceof Error ? e.message : String(e);
 				debug.error(e);
 
-				if (this.consecutiveFailures >= SyncController.MAX_CONSECUTIVE_FAILURES) {
+				if (e instanceof RepositoryUnavailableError) {
+					this.status = { type: "stop", message: "repository-unavailable", error: e.message };
+					this.onRepositoryUnavailable?.();
+					new Notice(`${e.message} Local files were preserved. Choose another repository or restore access before resuming sync.`, 0);
+				} else {
+					this.consecutiveFailures++;
+				}
+
+				if (this.status.type === "busy" && this.consecutiveFailures >= SyncController.MAX_CONSECUTIVE_FAILURES) {
 					this.status = { type: "stop", message: "error" };
 					new Notice(`Sync failed after ${this.consecutiveFailures} attempts: ${(e as Error).message}`);
-				} else {
+				} else if (this.status.type === "busy") {
 					debug.warn(`Sync attempt ${this.consecutiveFailures} failed, retrying: ${(e as Error).message}`);
 				}
 			} finally {
@@ -612,10 +1550,14 @@ export class SyncController {
 					this.status = { type: "stop" };
 					debug.log("Sync stopped");
 				} else {
-					this.status = { type: "idle" };
-					const delay = failed
-						? Math.min(this.settings.interval * (2 ** (this.consecutiveFailures - 1)), SyncController.MAX_BACKOFF_MS)
-						: this.settings.interval;
+					this.status = failed ? { type: "idle", error: failureMessage } : { type: "idle" };
+					let delay = this.settings.interval;
+					if (this.syncRequested) {
+						delay = 0;
+					} else if (failed) {
+						delay = Math.min(this.settings.interval * (2 ** (this.consecutiveFailures - 1)), SyncController.MAX_BACKOFF_MS);
+					}
+					this.syncRequested = false;
 					this.timeoutId = window.setTimeout(() => {
 						void this.syncCycle();
 					}, delay);
@@ -625,6 +1567,7 @@ export class SyncController {
 	}
 
 	async stopSyncAsync (): Promise<void> {
+		this.syncRequested = false;
 		if (this.status.type == "idle") {
 			window.clearTimeout(this.timeoutId);
 			this.status = { type: "stop" };
@@ -634,15 +1577,13 @@ export class SyncController {
 			this.status.toStop = true;
 			debug.log("Sync stopping");
 			await new Promise<void>(resolve => {
-				const oldListener = this.onSyncStatusChanged;
-				this.onSyncStatusChanged = (status) => {
+				let unsubscribe = () => {};
+				unsubscribe = this.subscribeStatus(status => {
 					if (status.type == "stop") {
-						this.onSyncStatusChanged = oldListener;
+						unsubscribe();
 						resolve();
 					}
-
-					oldListener?.(status);
-				};
+				});
 			});
 		} else {
 			await Promise.resolve();

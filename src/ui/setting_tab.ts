@@ -3,17 +3,38 @@ import type SeafilePlugin from "src/main";
 import { debug } from "src/utils";
 import { server } from "src/config";
 import { getPasswordStore } from "src/password_store";
+import { SEAFILE_IGNORE_FILE } from "src/ignore";
 import Dialog from "./dialog_modal";
 import LoginModal from "./login_modal";
 import PasswordModal from "./password_modal";
 import RepoModal from "./repo_modal";
+import TokenLoginModal from "./token_login_modal";
+import { resolveNotificationUrl, type NotificationStatus } from "src/notification";
+import type { SyncStatus } from "src/sync/controller";
+import type { SyncStatusTextMode } from "src/settings";
+import { formatSyncActivity } from "./sync_progress";
 
 export class SeafileSettingTab extends PluginSettingTab {
+	private unsubscribeNotificationStatus: (() => void) | null = null;
+	private unsubscribeSyncStatus: (() => void) | null = null;
+
 	constructor(public app: App, private readonly plugin: SeafilePlugin) {
 		super(app, plugin);
 	}
 
+	hide(): void {
+		this.unsubscribeNotificationStatus?.();
+		this.unsubscribeNotificationStatus = null;
+		this.unsubscribeSyncStatus?.();
+		this.unsubscribeSyncStatus = null;
+		super.hide();
+	}
+
 	display(): void {
+		this.unsubscribeNotificationStatus?.();
+		this.unsubscribeNotificationStatus = null;
+		this.unsubscribeSyncStatus?.();
+		this.unsubscribeSyncStatus = null;
 		const settings = this.plugin.settings;
 		const { containerEl } = this;
 		containerEl.empty();
@@ -35,6 +56,7 @@ export class SeafileSettingTab extends PluginSettingTab {
 						if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Invalid protocol");
 						settings.host = url.origin;
 						await this.plugin.saveSettings();
+						this.plugin.refreshNotifications();
 						new Notice("Host saved");
 					} catch (error) {
 						new Notice((error as Error).message);
@@ -44,6 +66,7 @@ export class SeafileSettingTab extends PluginSettingTab {
 			);
 		const accountDefaultDesc = "Not logged in.";
 		let accountButton: ButtonComponent;
+		let tokenButton: ButtonComponent;
 		const accountSetting = new Setting(containerEl)
 			.setName("Account")
 			.setDesc(settings.account ? settings.account : accountDefaultDesc)
@@ -74,36 +97,61 @@ export class SeafileSettingTab extends PluginSettingTab {
 						if (oldRepoId) await getPasswordStore(this.app).clear(oldRepoId);
 						await this.plugin.saveSettings();
 						accountButton.setButtonText("Log in");
+						tokenButton.setDisabled(false);
 						accountSetting.setDesc(accountDefaultDesc);
 						repoSetting.setDesc(repoDefaultDesc);
 					} else {
 						// Login
-						new LoginModal(this.app, async (account, token, deviceName, deviceId) => {
-							settings.account = account;
-							settings.authToken = token;
-							settings.deviceName = deviceName;
-							settings.deviceId = deviceId;
-							await this.plugin.saveSettings();
-
-							accountButton.setButtonText("Log out");
-							accountSetting.setDesc(account);
-						}).open();
+						if (!settings.host) {
+							new Notice("Save the Seafile host first.");
+							return;
+						}
+						new LoginModal(this.app, applyLogin).open();
 					}
 				});
+			})
+			.addButton(button => {
+				tokenButton = button;
+				button.setButtonText("Use API token")
+					.setDisabled(!!settings.account)
+					.onClick(() => {
+						if (!settings.host) {
+							new Notice("Save the Seafile host first.");
+							return;
+						}
+						new TokenLoginModal(this.app, applyLogin).open();
+					});
 			});
+		const applyLogin = async (account: string, token: string, deviceName: string, deviceId: string): Promise<void> => {
+			settings.account = account;
+			settings.authToken = token;
+			settings.deviceName = deviceName;
+			settings.deviceId = deviceId;
+			await this.plugin.saveSettings();
 
+			accountButton.setButtonText("Log out");
+			tokenButton.setDisabled(true);
+			accountSetting.setDesc(account);
+		};
 		const repoDefaultDesc = "Choose a repository to sync.";
+		const repositoryUnavailable = this.plugin.sync.status.type === "stop" && this.plugin.sync.status.message === "repository-unavailable";
+		let repoButton: ButtonComponent;
 		const repoSetting = new Setting(containerEl)
 			.setName("Repository")
-			.setDesc(settings.repoName ? settings.repoName : repoDefaultDesc)
+			.setDesc(repositoryUnavailable
+				? `${settings.repoName || "Configured repository"} is unavailable. Choose a replacement without deleting local files.`
+				: settings.repoName ? settings.repoName : repoDefaultDesc)
 			.addButton(button => {
-				button.setButtonText("Choose");
+				repoButton = button;
+				button.setButtonText(repositoryUnavailable ? "Choose replacement" : "Choose");
 				button.onClick(async () => {
 					if (!settings.authToken) {
 						new Notice("Log in first before choosing a repository");
 						return;
 					}
-					if (settings.repoToken) {
+					const preserveVault = this.plugin.sync.status.type === "stop" && this.plugin.sync.status.message === "repository-unavailable";
+					const oldRepoId = settings.repoId;
+					if (settings.repoToken && !preserveVault) {
 						const result = await this.askClearVault("To change repository, you need to clear your vault first.\n\n");
 						if (!result) return;
 
@@ -122,7 +170,12 @@ export class SeafileSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					}
 					new RepoModal(this.app, async ({ repoName, repoId, info }) => {
+						const replacingRepository = preserveVault && repoId !== oldRepoId;
 						const applyAndStart = async () => {
+							if (replacingRepository) {
+								await this.plugin.resetSyncForRepositoryChange();
+								if (oldRepoId) await getPasswordStore(this.app).clear(oldRepoId);
+							}
 							settings.repoName = repoName;
 							settings.repoId = repoId;
 							settings.repoToken = info.token;
@@ -132,8 +185,10 @@ export class SeafileSettingTab extends PluginSettingTab {
 							settings.repoMagic = info.magic;
 							settings.randomKey = info.random_key;
 							repoSetting.setDesc(repoName);
+							repoButton.setButtonText("Choose");
 							await this.plugin.saveSettings();
-							if (settings.enableSync) this.plugin.sync.startSync();
+							if (settings.enableSync) await this.plugin.enableSync();
+							if (replacingRepository) new Notice("Repository changed. Local vault files were preserved.");
 						};
 
 						if (info.encrypted) {
@@ -196,10 +251,19 @@ export class SeafileSettingTab extends PluginSettingTab {
 			})();
 		}
 
+		const describeSyncStatus = (status: SyncStatus): string => {
+			if (!settings.enableSync) return "Disabled";
+			if (status.type === "busy") return formatSyncActivity(status);
+			if (status.type === "idle" && status.error) return `Retry scheduled: ${status.error}`;
+			if (status.type === "idle") return "Enabled and waiting for changes";
+			if (status.message === "repository-unavailable") return "Stopped because the configured repository is unavailable. Local files were preserved.";
+			if (status.message === "error") return "Stopped after repeated sync failures";
+			return "Enabled, but synchronization is stopped";
+		};
 		let enableSyncButton: ButtonComponent;
 		const enableSyncSetting = new Setting(containerEl)
 			.setName("Sync status")
-			.setDesc(settings.enableSync ? "Enabled" : "Disabled")
+			.setDesc(describeSyncStatus(this.plugin.sync.status))
 			.addButton(button => {
 				enableSyncButton = button;
 				button.setButtonText(settings.enableSync ? "Disable" : "Enable");
@@ -211,14 +275,12 @@ export class SeafileSettingTab extends PluginSettingTab {
 							await this.plugin.disableSync();
 							new Notice("Sync disabled");
 							button.setButtonText("Enable");
-							enableSyncSetting.setDesc("Disabled");
 						} else {
 							// Enable sync
 							if (this.plugin.checkSyncReady()) {
 								await this.plugin.enableSync();
 								new Notice("Sync enabled");
 								button.setButtonText("Disable");
-								enableSyncSetting.setDesc("Enabled");
 							} else {
 								if (settings.authToken) {
 									if (!settings.repoToken) {
@@ -239,6 +301,23 @@ export class SeafileSettingTab extends PluginSettingTab {
 					}
 				});
 			});
+		this.unsubscribeSyncStatus = this.plugin.sync.subscribeStatus(status => {
+			enableSyncSetting.setDesc(describeSyncStatus(status));
+		});
+
+		new Setting(containerEl)
+			.setName("Sidebar status text")
+			.setDesc("Choose when text appears next to the sync button. The complete status is always available on hover.")
+			.addDropdown(dropdown => dropdown
+				.addOption("always", "Always show")
+				.addOption("syncing", "Only while syncing")
+				.addOption("never", "Never show")
+				.setValue(settings.syncStatusTextMode)
+				.onChange(async value => {
+					settings.syncStatusTextMode = value as SyncStatusTextMode;
+					await this.plugin.saveSettings();
+					this.plugin.explorerView?.syncStatusChanged(this.plugin.sync.status);
+				}));
 
 		new Setting(containerEl)
 			.setName("Manual sync")
@@ -254,6 +333,58 @@ export class SeafileSettingTab extends PluginSettingTab {
 					}
 				})
 			);
+
+		const describeNotificationStatus = (status: NotificationStatus): string => {
+			if (this.plugin.sync.status.type === "stop" && this.plugin.sync.status.message === "repository-unavailable") {
+				return "Stopped because the configured repository is unavailable. Local files were preserved.";
+			}
+			if (!settings.enableNotifications) return "Disabled. Periodic synchronization remains active.";
+			if (!settings.enableSync) return "Waiting for synchronization to be enabled.";
+			if (status.type === "connected") return "Connected. Remote library updates trigger synchronization immediately.";
+			if (status.type === "connecting") return "Connecting to the notification server…";
+			if (status.type === "fallback") return `Unavailable. Retrying in ${status.retryInSeconds} seconds; periodic synchronization remains active.`;
+			return "Waiting to connect. Periodic synchronization remains active.";
+		};
+		const notificationSetting = new Setting(containerEl)
+			.setName("Realtime sync")
+			.setDesc(describeNotificationStatus(this.plugin.notifications.status))
+			.addToggle(toggle => toggle
+				.setValue(settings.enableNotifications)
+				.onChange(async value => {
+					toggle.setDisabled(true);
+					try {
+						await this.plugin.setNotificationsEnabled(value);
+						notificationSetting.setDesc(describeNotificationStatus(this.plugin.notifications.status));
+					} finally {
+						toggle.setDisabled(false);
+					}
+				}));
+		this.unsubscribeNotificationStatus = this.plugin.notifications.subscribeStatus(status => {
+			notificationSetting.setDesc(describeNotificationStatus(status));
+		});
+
+		let notificationUrlText: TextComponent;
+		new Setting(containerEl)
+			.setName("Notification server URL")
+			.setDesc(`Leave blank to use ${resolveNotificationUrl(settings.host || "https://example.com", "")}.`)
+			.addText(text => {
+				notificationUrlText = text;
+				text.setPlaceholder("https://example.com/notification");
+				text.setValue(settings.notificationUrl);
+			})
+			.addButton(button => button
+				.setButtonText("Save")
+				.onClick(async () => {
+					try {
+						const value = notificationUrlText.getValue().trim();
+						if (value) resolveNotificationUrl(settings.host || value, value);
+						await this.plugin.setNotificationUrl(value);
+						new Notice("Notification server URL saved");
+					} catch (error) {
+						new Notice((error as Error).message);
+					}
+					notificationUrlText.setValue(settings.notificationUrl);
+				}));
 
 		let intervalText: TextComponent;
 		new Setting(containerEl)
@@ -282,26 +413,36 @@ export class SeafileSettingTab extends PluginSettingTab {
 
 		let ignoreText: TextAreaComponent;
 		new Setting(containerEl)
-			.setName("Ignore")
-			.setDesc("Use gitignore syntax.")
+			.setName("Seafile ignore file")
+			.setDesc(`Edit ${SEAFILE_IGNORE_FILE} in the library root. The same rules are used by standard Seafile clients; the plugin creates this file automatically when necessary.`)
 			.addTextArea(text => {
 				ignoreText = text;
-				text.setValue(settings.ignore);
+				text.setPlaceholder("Loading ignore rules…");
+				text.inputEl.rows = 12;
+				void this.plugin.sync.readIgnoreFile().then(contents => {
+					ignoreText.setValue(contents);
+				}).catch(error => {
+					debug.error("Failed to load Seafile ignore file", error);
+					new Notice("Failed to load Seafile ignore file: " + (error as Error).message);
+				});
 			})
 			.addButton(button => button
 				.setButtonText("Save")
 				.onClick(async () => {
 					button.setDisabled(true);
-					settings.ignore = ignoreText.getValue();
-					this.plugin.sync.setIgnorePattern(settings.ignore);
-					await this.plugin.saveSettings();
-					new Notice("Ignore pattern saved");
-					button.setDisabled(false);
+					try {
+						await this.plugin.sync.writeIgnoreFile(ignoreText.getValue());
+						new Notice(`${SEAFILE_IGNORE_FILE} saved`);
+					} catch (error) {
+						new Notice("Failed to save Seafile ignore file: " + (error as Error).message);
+					} finally {
+						button.setDisabled(false);
+					}
 				}));
 
 		new Setting(containerEl)
 			.setName("Dev mode")
-			.setDesc("Enable development mode. Need restart to take effect.")
+			.setDesc("Enable development logging, including sync phase timings and throughput. Restart required.")
 			.addToggle(toggle => toggle
 				.setValue(settings.devMode)
 				.onChange(async (value) => {

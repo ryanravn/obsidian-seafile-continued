@@ -3,6 +3,9 @@ import pThrottle from "p-throttle";
 import { posix as Path } from "path-browserify";
 import { type Commit, type SeafFs } from "./server";
 import * as config from "./config";
+
+export const SEAFILE_BLOCK_SIZE = 8 * 1024 * 1024;
+
 export class FormData {
 	private readonly boundary: string;
 	private readonly data: unknown[];
@@ -192,7 +195,7 @@ export async function computeBlocks(buffer: ArrayBuffer): Promise<Record<string,
 	const size = buffer.byteLength;
 
 	const blocks: Record<string, ArrayBuffer> = {};
-	const blockSize = 8 * 1024 * 1024; // 8MB
+	const blockSize = SEAFILE_BLOCK_SIZE;
 	const numBlocks = Math.ceil(size / blockSize);
 	for (let i = 0; i < numBlocks; i++) {
 		const block = buffer.slice(i * blockSize, (i + 1) * blockSize);
@@ -208,7 +211,7 @@ export async function computeBlocks(buffer: ArrayBuffer): Promise<Record<string,
 export async function computeBlocksEncrypted(buffer: ArrayBuffer, encrypt: (chunk: ArrayBuffer) => Promise<ArrayBuffer>): Promise<Record<string, ArrayBuffer>> {
 	const size = buffer.byteLength;
 	const blocks: Record<string, ArrayBuffer> = {};
-	const blockSize = 8 * 1024 * 1024;
+	const blockSize = SEAFILE_BLOCK_SIZE;
 	const numBlocks = Math.ceil(size / blockSize);
 	for (let i = 0; i < numBlocks; i++) {
 		const plain = buffer.slice(i * blockSize, (i + 1) * blockSize);

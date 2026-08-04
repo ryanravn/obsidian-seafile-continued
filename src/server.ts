@@ -148,6 +148,21 @@ export class MfaRequiredError extends Error {
 	}
 }
 
+export class HttpError extends Error {
+	constructor(public readonly status: number, public readonly response: unknown) {
+		const detail = response && typeof response === "object" && "error_msg" in response && typeof response.error_msg === "string"
+			? response.error_msg
+			: JSON.stringify(response);
+		super(`HTTP ${status}. Response: ${detail}`);
+	}
+}
+
+export class RepositoryUnavailableError extends Error {
+	constructor(public readonly status: number) {
+		super("The configured Seafile repository no longer exists or is no longer accessible.");
+	}
+}
+
 export interface RepoDownloadInfo {
   token: string
   encrypted: boolean
@@ -158,6 +173,7 @@ export interface RepoDownloadInfo {
 }
 
 export default class Server {
+	private static readonly REQUEST_TIMEOUT_MS = 120 * 1000;
 	public crypto: RepoCrypto | null = null;
 
 	public constructor (private readonly settings: SeafileSettings,
@@ -168,7 +184,7 @@ export default class Server {
 	private async request (req: RequestUrlParam & RequestParam): Promise<RequestResponse> {
 		if(!this.settings.useFetch)
 		{
-			const response = await pTimeout(requestUrl(req), { milliseconds: 120 * 1000 });
+			const response = await pTimeout(requestUrl(req), { milliseconds: Server.REQUEST_TIMEOUT_MS });
 			return {
 				status: response.status,
 				text: () => Promise.resolve(response.text),
@@ -179,16 +195,31 @@ export default class Server {
 		else
 		{
 			// Intentional opt-in alternative to requestUrl, gated by settings.useFetch.
-			const response = await window.fetch(req.url, {
+			const controller = new AbortController();
+			const withTimeout = async <T>(task: () => Promise<T>): Promise<T> => {
+				const timeoutId = window.setTimeout(() => controller.abort(), Server.REQUEST_TIMEOUT_MS);
+				try {
+					return await task();
+				} catch (error) {
+					if (controller.signal.aborted) {
+						throw new Error(`Seafile request timed out after ${Server.REQUEST_TIMEOUT_MS / 1000} seconds.`);
+					}
+					throw error;
+				} finally {
+					window.clearTimeout(timeoutId);
+				}
+			};
+			const response = await withTimeout(async () => await window.fetch(req.url, {
 				method: req.method,
 				headers: req.headers,
 				body: req.body,
-			});
+				signal: controller.signal,
+			}));
 			return {
 				status: response.status,
-				text: () => response.text(),
-				json: () => response.json() as Promise<unknown>,
-				arrayBuffer: () => response.arrayBuffer()
+				text: async () => await withTimeout(async () => await response.text()),
+				json: async () => await withTimeout(async () => await response.json() as unknown),
+				arrayBuffer: async () => await withTimeout(async () => await response.arrayBuffer())
 			};
 		}
 	}
@@ -209,13 +240,19 @@ export default class Server {
 		} else if (req.responseType === "binary") {
 			ret = await resp.arrayBuffer();
 		} else {
-			const json = await resp.json() as { error_msg?: string };
-			ret = json;
-			if (json.error_msg) { throw new Error(json.error_msg); }
+			const text = await resp.text();
+			try {
+				ret = JSON.parse(text) as unknown;
+			} catch {
+				ret = text;
+			}
 		}
 
-		if (!status.startsWith("2") && !status.startsWith("3")) {
-			throw new Error(`HTTP ${status}. Response: ${JSON.stringify(ret)}`);
+		if (!status.startsWith("2")) {
+			throw new HttpError(resp.status, ret);
+		}
+		if (ret && typeof ret === "object" && "error_msg" in ret && typeof ret.error_msg === "string") {
+			throw new Error(ret.error_msg);
 		}
 
 		return ret;
@@ -227,6 +264,35 @@ export default class Server {
 		req.url = `${this.settings.host}/seafhttp/${req.url}`;
 
 		return await this.sendRequest(req);
+	}
+
+	async checkNotificationServer(notificationUrl: string): Promise<void> {
+		const response = await this.sendRequest({
+			url: `${notificationUrl.replace(/\/+$/, "")}/ping`,
+			responseType: "text",
+			retry: 0
+		}) as string;
+		let data: { ret?: unknown };
+		try {
+			data = JSON.parse(response) as { ret?: unknown };
+		} catch {
+			throw new Error("Notification server returned an unexpected ping response.");
+		}
+		if (data.ret !== "pong") {
+			throw new Error("Notification server did not answer the ping request.");
+		}
+	}
+
+	async getNotificationJwtToken(repoId: string): Promise<string> {
+		const response = await this.requestSeafHttp({
+			url: `repo/${encodeURIComponent(repoId)}/jwt-token`,
+			responseType: "json",
+			retry: 0
+		}) as { jwt_token?: unknown };
+		if (typeof response.jwt_token !== "string" || !response.jwt_token) {
+			throw new Error("Seafile did not return a notification token.");
+		}
+		return response.jwt_token;
 	}
 
 	async requestAPIv20 (req: RequestParam) {
@@ -359,15 +425,30 @@ export default class Server {
 	}
 
 	async getRepoList (): Promise<Repo[]> {
+		return await this.getRepoListWithToken(this.settings.authToken);
+	}
+
+	async validateAuthToken(authToken: string): Promise<void> {
+		const token = authToken.trim();
+		if (!token) throw new Error("API token is required.");
+
+		await this.getRepoListWithToken(token);
+	}
+
+	private async getRepoListWithToken(authToken: string): Promise<Repo[]> {
 		const resp = await this.sendRequest({
 			url: `${this.settings.host}/api/v2.1/repos/`,
 			headers: {
-				Authorization: `Token ${this.settings.authToken}`
+				Authorization: `Token ${authToken}`
 			},
 			responseType: "json"
-		}) as { repos: Repo[] };
+		}) as { repos?: unknown };
 
-		return resp.repos;
+		if (!Array.isArray(resp.repos)) {
+			throw new Error("The server returned an unexpected repository response.");
+		}
+
+		return resp.repos as Repo[];
 	}
 
 	async getRepoToken (repoId: string): Promise<string> {
@@ -537,8 +618,15 @@ export default class Server {
 	}
 
 	async getHeadCommitId (): Promise<string> {
-		const resp = await this.requestSeafHttp({ url: `repo/${this.settings.repoId}/commit/HEAD` }) as { head_commit_id: string };
-		return resp.head_commit_id;
+		try {
+			const resp = await this.requestSeafHttp({ url: `repo/${this.settings.repoId}/commit/HEAD` }) as { head_commit_id: string };
+			return resp.head_commit_id;
+		} catch (error) {
+			if (error instanceof HttpError && [403, 404, 444].includes(error.status)) {
+				throw new RepositoryUnavailableError(error.status);
+			}
+			throw error;
+		}
 	}
 
 	getCommitInfo = utils.memoizeWithLimit(async (commit: string) => {
@@ -686,7 +774,8 @@ export default class Server {
 
 		// Prepare fs data
 		const utf8Encoder = new TextEncoder();
-		let data = new Uint8Array();
+		const chunks: Uint8Array[] = [];
+		let totalSize = 0;
 		for (const task of fsList) {
 			const [fsId, fs] = task;
 			if (!fs) {
@@ -702,8 +791,15 @@ export default class Server {
 				combinedData.set(new Uint8Array(idData), 0);
 				combinedData.set(new Uint8Array(sizeBuffer), idData.byteLength);
 				combinedData.set(new Uint8Array(compressed), idData.byteLength + sizeBuffer.byteLength);
-				data = utils.concatTypedArrays(data, combinedData);
+				chunks.push(combinedData);
+				totalSize += combinedData.byteLength;
 			}
+		}
+		const data = new Uint8Array(totalSize);
+		let offset = 0;
+		for (const chunk of chunks) {
+			data.set(chunk, offset);
+			offset += chunk.byteLength;
 		}
 
 		// Send fs data
@@ -748,6 +844,10 @@ export default class Server {
 				responseType: "binary",
 				retry: 0
 			}) as ArrayBuffer;
+		const actualBlockId = await utils.sha1(resp);
+		if (actualBlockId !== blockId) {
+			throw new Error(`Downloaded block failed integrity verification: expected '${blockId}', received '${actualBlockId}'.`);
+		}
 		if (this.crypto) {
 			return await this.crypto.decryptBlock(resp);
 		}
@@ -757,8 +857,15 @@ export default class Server {
 	async sendBlock (id: string, data: ArrayBuffer): Promise<void> {
 		const needUpload = await this.checkBlock(id);
 		if (needUpload) {
-			await this.requestSeafHttp({ url: `repo/${this.settings.repoId}/block/${id}`, method: "PUT", body: data, retry: 0, responseType: "text" });
+			await this.uploadBlock(id, data);
 		}
+	}
+
+	// Upload a block already known to be absent. Callers that have a complete
+	// file manifest can batch check all block IDs and avoid one extra round trip
+	// per block by using this method directly.
+	async uploadBlock (id: string, data: ArrayBuffer): Promise<void> {
+		await this.requestSeafHttp({ url: `repo/${this.settings.repoId}/block/${id}`, method: "PUT", body: data, retry: 0, responseType: "text" });
 	}
 
 	// check if the blocks are in the server

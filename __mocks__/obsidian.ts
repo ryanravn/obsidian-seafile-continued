@@ -3,6 +3,22 @@ import { App, DataAdapter, DataWriteOptions, ListedFiles, RequestUrlParam, Reque
 import { PlatformPath } from 'path/posix';
 export const Path = (require("path-browserify").posix) as PlatformPath;
 
+export const Platform = {
+    isDesktop: true,
+    isMobile: false,
+};
+
+export class Notice {
+    constructor(_message: string, _timeout?: number) {}
+    hide(): void {}
+}
+
+export class FileSystemAdapter {
+    getFullPath(_normalizedPath: string): string {
+        throw new Error("Method not implemented.");
+    }
+}
+
 export function requestUrl(request: RequestUrlParam | string): RequestUrlResponsePromise {
     if (typeof request === "string") request = { url: request };
     if (request.body && typeof request.body !== "string") request.body = Buffer.from(request.body as ArrayBuffer)
@@ -48,11 +64,14 @@ export function arrayBufferToHex(data: ArrayBuffer): string {
     return hex;
 }
 
-class MockDataAdapter implements DataAdapter {
+class MockDataAdapter extends FileSystemAdapter implements DataAdapter {
     private cwdPath: string = Path.join(process.cwd(), "temp")
 
     private resolvePath(filePath: string): string {
         return Path.join(this.cwdPath, filePath);
+    }
+    getFullPath(normalizedPath: string): string {
+        return this.resolvePath(normalizedPath);
     }
     private async updateModificationTime(absPath: string, mtime: Date): Promise<void> {
         await fs.utimes(absPath, new Date(), mtime);
@@ -147,7 +166,7 @@ class MockDataAdapter implements DataAdapter {
         await fs.rm(this.resolvePath(normalizedPath));
     }
     rename(normalizedPath: string, normalizedNewPath: string): Promise<void> {
-        throw new Error('Method not implemented.');
+        return fs.rename(this.resolvePath(normalizedPath), this.resolvePath(normalizedNewPath));
     }
     copy(normalizedPath: string, normalizedNewPath: string): Promise<void> {
         throw new Error('Method not implemented.');

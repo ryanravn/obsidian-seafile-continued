@@ -12,7 +12,11 @@ export type STATE_UPLOAD = {
 	param: {
 		progress: number,
 		fs: SeafFs | null,
-		blocks?: Record<string, ArrayBuffer>
+		source?: {
+			path: string,
+			size: number,
+			mtime: number
+		}
 	}
 }
 export type STATE_SYNC = {
@@ -28,6 +32,7 @@ export type STATE_DELETE = {
 export type SyncState = STATE_INIT | STATE_DOWNLOAD | STATE_UPLOAD | STATE_SYNC | STATE_DELETE;
 
 export type SyncStateChangedListener = (node: SyncNode) => void;
+export type SyncStatesChangedListener = (nodes: SyncNode[]) => void;
 
 export type SerializedSyncNode = {
 	prev: SeafDirent | null,
@@ -38,6 +43,9 @@ export type SerializedLogData = [string, SeafDirent | null];
 
 export class SyncNode {
 	public static onStateChanged: SyncStateChangedListener | undefined;
+	public static onStatesChanged: SyncStatesChangedListener | undefined;
+	private static notificationBatchDepth = 0;
+	private static readonly batchedNotifications = new Set<SyncNode>();
 	private static _dataLogCount = 0;
 	public static get dataLogCount() { return this._dataLogCount; }
 	private static set dataLogCount(value: number) { this._dataLogCount = value; }
@@ -65,11 +73,32 @@ export class SyncNode {
 		this._state = new Proxy(value, {
 			set: (target, prop, value) => {
 				Reflect.set(target, prop, value);
-				SyncNode.onStateChanged?.(this);
+				SyncNode.notifyStateChanged(this);
 				return true;
 			}
 		});
-		SyncNode.onStateChanged?.(this);
+		SyncNode.notifyStateChanged(this);
+	}
+
+	private static notifyStateChanged(node: SyncNode): void {
+		if (this.notificationBatchDepth > 0) {
+			this.batchedNotifications.add(node);
+			return;
+		}
+		this.onStateChanged?.(node);
+	}
+
+	private static beginNotificationBatch(): void {
+		this.notificationBatchDepth++;
+	}
+
+	private static endNotificationBatch(): void {
+		this.notificationBatchDepth--;
+		if (this.notificationBatchDepth !== 0 || this.batchedNotifications.size === 0) return;
+		const nodes = Array.from(this.batchedNotifications);
+		this.batchedNotifications.clear();
+		if (this.onStatesChanged) this.onStatesChanged(nodes);
+		else for (const node of nodes) this.onStateChanged?.(node);
 	}
 
 	public static serialize(node: SyncNode): SerializedSyncNode {
@@ -154,6 +183,36 @@ export class SyncNode {
 		await adapter.write(SYNC_DATA_PATH, JSON.stringify(data));
 		await adapter.write(SYNC_DLOG_PATH, "");
 		SyncNode.dataLogCount = 0;
+	}
+
+	public static async applyNextBatch(nodes: SyncNode[], onProgress?: (completed: number) => void): Promise<void> {
+		const changed = new Set<SyncNode>();
+		const lines: string[] = [];
+		for (const node of nodes) {
+			const next = node.next;
+			if (!(next?.id === node.prev?.id && next?.mtime === node.prev?.mtime)) {
+				changed.add(node);
+				lines.push(JSON.stringify([node.path, next ?? null] as SerializedLogData));
+			}
+		}
+		if (lines.length > 0) {
+			await adapter.append(SYNC_DLOG_PATH, lines.join("\n") + "\n");
+			SyncNode.dataLogCount += lines.length;
+		}
+
+		this.beginNotificationBatch();
+		try {
+			let completed = 0;
+			for (const node of nodes) {
+				if (changed.has(node)) node.prev = node.next;
+				node.prevDirty = node.nextDirty;
+				node.setNext(undefined, true);
+				node.state = node.prevDirty ? { type: "init" } : { type: "sync" };
+				onProgress?.(++completed);
+			}
+		} finally {
+			this.endNotificationBatch();
+		}
 	}
 
 	private async appendDataLog(dirent: SeafDirent | undefined | null) {
