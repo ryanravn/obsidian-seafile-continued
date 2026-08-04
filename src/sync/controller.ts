@@ -1,11 +1,11 @@
-import * as IgnoreParser from "gitignore-parser";
 import { posix as Path } from "path-browserify";
 import { Notice, Platform, type DataAdapter } from "obsidian";
 import { type SeafileSettings } from "src/settings";
-import { DEFAULT_IGNORE, HEAD_COMMIT_PATH, SYNC_DATA_PATH, SYNC_DLOG_PATH, server } from "../config";
-import { MODE_DIR, MODE_FILE, ZeroFs, type DirSeafDirent, type DirSeafFs, type FileSeafDirent, type FileSeafFs, type SeafDirent, type SeafFs } from "../server";
+import { DEFAULT_SEAFILE_IGNORE, HEAD_COMMIT_PATH, PLUGIN_DIR, SYNC_DATA_PATH, SYNC_DLOG_PATH, server } from "../config";
+import { MODE_DIR, MODE_FILE, TYPE_FILE, ZeroFs, type DirSeafDirent, type DirSeafFs, type FileSeafDirent, type FileSeafFs, type SeafDirent, type SeafFs } from "../server";
 import * as utils from "../utils";
 import { debug } from "../utils";
+import { compileIgnoreList, SEAFILE_IGNORE_FILE, type IgnoreList } from "../ignore";
 import { SyncNode, type STATE_UPLOAD, type SyncStateChangedListener as NodeStateChangedListener } from "./node";
 import { MobileDataAdapter } from "src/@types/obsidian";
 
@@ -32,22 +32,91 @@ export interface SYNC_STOP {
 export type SyncStatus = SYNC_IDLE | SYNC_BUSY | SYNC_STOP
 
 export class SyncController {
-	private ignore: {
-    accepts: (input: string) => boolean
-    denies: (input: string) => boolean
-    maybe: (input: string) => boolean
-  };
+	private ignore: IgnoreList = compileIgnoreList("");
+	private ignoreFileBootstrapped = false;
 
 	private nodeRoot: SyncNode;
 
 	public constructor (
     private readonly adapter: DataAdapter,
-    private readonly settings: SeafileSettings) {
-		this.setIgnorePattern(settings.ignore);
+	private readonly settings: SeafileSettings) {}
+
+	private normalizePath(path: string): string {
+		while (path.startsWith("/")) path = path.slice(1);
+		while (path.endsWith("/")) path = path.slice(0, -1);
+		return path;
 	}
 
-	public setIgnorePattern (pattern: string) {
-		this.ignore = IgnoreParser.compile(DEFAULT_IGNORE + "\n" + pattern);
+	private isInternalPath(path: string): boolean {
+		const normalized = this.normalizePath(path);
+		return normalized === PLUGIN_DIR || normalized.startsWith(PLUGIN_DIR + "/");
+	}
+
+	public isPathIgnored(path: string, isDirectory = false): boolean {
+		return this.isInternalPath(path) || this.ignore.denies(path, isDirectory);
+	}
+
+	public async readIgnoreFile(): Promise<string> {
+		if (await this.adapter.exists(SEAFILE_IGNORE_FILE)) return await this.adapter.read(SEAFILE_IGNORE_FILE);
+		return DEFAULT_SEAFILE_IGNORE;
+	}
+
+	public async reloadIgnoreFile(): Promise<void> {
+		this.ignore = compileIgnoreList(await this.readIgnoreFile());
+	}
+
+	private async storeIgnoreFile(contents: string, mtime?: number): Promise<void> {
+		this.ignoreChange.add("/" + SEAFILE_IGNORE_FILE);
+		try {
+			await this.adapter.write(SEAFILE_IGNORE_FILE, contents, mtime === undefined ? undefined : { mtime });
+		} finally {
+			this.ignoreChange.delete("/" + SEAFILE_IGNORE_FILE);
+		}
+		this.ignore = compileIgnoreList(contents);
+		this.nodeRoot?.setDirty("/" + SEAFILE_IGNORE_FILE);
+	}
+
+	public async writeIgnoreFile(contents: string): Promise<void> {
+		await this.storeIgnoreFile(contents);
+	}
+
+	private async readRemoteFile(remote: FileSeafDirent): Promise<string> {
+		const [, rawFs] = await server.getFs(remote.id);
+		if (!rawFs || rawFs.type !== TYPE_FILE || !("block_ids" in rawFs) || rawFs.size !== remote.size) {
+			throw new Error(`Remote file metadata failed verification for '${SEAFILE_IGNORE_FILE}'.`);
+		}
+		const bytes = new Uint8Array(remote.size);
+		let offset = 0;
+		for (const blockId of rawFs.block_ids) {
+			const block = new Uint8Array(await server.getBlock(blockId));
+			if (offset + block.byteLength > bytes.byteLength) throw new Error("Remote ignore file exceeds its declared size.");
+			bytes.set(block, offset);
+			offset += block.byteLength;
+		}
+		if (offset !== bytes.byteLength) throw new Error("Remote ignore file does not match its declared size.");
+		return new TextDecoder().decode(bytes);
+	}
+
+	private async bootstrapIgnoreFile(remoteRoot: DirSeafDirent): Promise<void> {
+		if (this.ignoreFileBootstrapped) return;
+		const [, rawRootFs] = await server.getFs(remoteRoot.id);
+		const remoteIgnore = rawRootFs && rawRootFs.type === 3 && "dirents" in rawRootFs
+			? rawRootFs.dirents.find(entry => entry.name === SEAFILE_IGNORE_FILE && entry.mode === MODE_FILE) as FileSeafDirent | undefined
+			: undefined;
+		const localExists = await this.adapter.exists(SEAFILE_IGNORE_FILE);
+		const localContents = localExists ? await this.adapter.read(SEAFILE_IGNORE_FILE) : "";
+		const remoteContents = remoteIgnore ? await this.readRemoteFile(remoteIgnore) : "";
+
+		if (!localExists) {
+			await this.storeIgnoreFile(
+				remoteIgnore ? remoteContents : DEFAULT_SEAFILE_IGNORE,
+				remoteIgnore ? remoteIgnore.mtime * 1000 : undefined
+			);
+		}
+		// When both copies differ, the union is deliberately conservative for
+		// this first traversal. Normal conflict handling then resolves the file.
+		this.ignore = compileIgnoreList([localContents, remoteContents, !localExists && !remoteIgnore ? DEFAULT_SEAFILE_IGNORE : ""].filter(Boolean).join("\n"));
+		this.ignoreFileBootstrapped = true;
 	}
 
 	// Load sync data
@@ -118,8 +187,9 @@ export class SyncController {
 	}
 
 	public async pull (changes: NodeChange[], path: string, node: SyncNode, remote?: SeafDirent) {
-		// Step 0. Check ignore pattern
-		if (this.ignore.denies(path)) {
+		// Operational plugin state is never part of the library, even if a
+		// malformed or remotely edited ignore file omits the recommended rule.
+		if (this.isInternalPath(path)) {
 			if (remote) {
 				await node.setPrevAsync(remote, false);
 				node.state = { type: "sync" };
@@ -132,6 +202,21 @@ export class SyncController {
 
 		// Step 1. Check file status: same, local, remote, merge, conflict
 		const local = await utils.fastStat(path);
+		const isDirectory = local?.type === "folder" || remote?.mode === MODE_DIR || node.prev?.mode === MODE_DIR;
+		const ignored = this.ignore.denies(path, isDirectory);
+
+		// Seafile ignore rules are upload-side exclusions. New local entries are
+		// not uploaded, while entries already present on the server may still be
+		// downloaded. If the server version is unchanged, ignore local edits.
+		if (ignored && !remote && !node.prev) {
+			await node.delete();
+			return;
+		}
+		if (ignored && node.prev && remote && node.prev.id === remote.id) {
+			await node.setPrevAsync(remote, false);
+			node.state = { type: "sync" };
+			return;
+		}
 
 		let target = null;
 		// Same:
@@ -500,6 +585,10 @@ export class SyncController {
 	private readonly ignoreChange = new Set<string>();
 	async notifyChange (path: string, type: "create" | "modify" | "delete") {
 		if (this.ignoreChange.has(path)) return;
+		if (this.normalizePath(path) === SEAFILE_IGNORE_FILE) {
+			const contents = type === "delete" ? "" : await this.adapter.read(SEAFILE_IGNORE_FILE);
+			this.ignore = compileIgnoreList(contents);
+		}
 
 		if (type == "create") {
 			if (this.nodeRoot.find(path)) return;
@@ -531,6 +620,7 @@ export class SyncController {
 		const changes: NodeChange[] = [];
 		const remoteHead = await server.getHeadCommitId();
 		const remoteRoot = await server.getCommitRoot(remoteHead);
+		await this.bootstrapIgnoreFile(remoteRoot);
 
 		this.status.message = "download";
 		await this.pull(changes, "", this.nodeRoot, remoteRoot);

@@ -8,7 +8,6 @@ export interface SeafileSettings {
   deviceName: string
   deviceId: string
   interval: number
-  ignore: string
   devMode: boolean
   enableSync: boolean
   useFetch: boolean
@@ -31,7 +30,6 @@ export const DEFAULT_SETTINGS: SeafileSettings = {
 	deviceName: "obsidian-seafile",
 	deviceId: "",
 	interval: 30000,
-	ignore: "",
 	devMode: false,
 	enableSync: false,
 	useFetch: false,

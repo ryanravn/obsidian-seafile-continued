@@ -3,6 +3,11 @@ import { App, DataAdapter, DataWriteOptions, ListedFiles, RequestUrlParam, Reque
 import { PlatformPath } from 'path/posix';
 export const Path = (require("path-browserify").posix) as PlatformPath;
 
+export const Platform = {
+    isDesktop: true,
+    isMobile: false,
+};
+
 export function requestUrl(request: RequestUrlParam | string): RequestUrlResponsePromise {
     if (typeof request === "string") request = { url: request };
     if (request.body && typeof request.body !== "string") request.body = Buffer.from(request.body as ArrayBuffer)

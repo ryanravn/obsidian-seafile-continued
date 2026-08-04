@@ -3,6 +3,7 @@ import type SeafilePlugin from "src/main";
 import { debug } from "src/utils";
 import { server } from "src/config";
 import { getPasswordStore } from "src/password_store";
+import { SEAFILE_IGNORE_FILE } from "src/ignore";
 import Dialog from "./dialog_modal";
 import LoginModal from "./login_modal";
 import PasswordModal from "./password_modal";
@@ -282,21 +283,31 @@ export class SeafileSettingTab extends PluginSettingTab {
 
 		let ignoreText: TextAreaComponent;
 		new Setting(containerEl)
-			.setName("Ignore")
-			.setDesc("Use gitignore syntax.")
+			.setName("Seafile ignore file")
+			.setDesc(`Edit ${SEAFILE_IGNORE_FILE} in the library root. The same rules are used by standard Seafile clients; the plugin creates this file automatically when necessary.`)
 			.addTextArea(text => {
 				ignoreText = text;
-				text.setValue(settings.ignore);
+				text.setPlaceholder("Loading ignore rules…");
+				text.inputEl.rows = 12;
+				void this.plugin.sync.readIgnoreFile().then(contents => {
+					ignoreText.setValue(contents);
+				}).catch(error => {
+					debug.error("Failed to load Seafile ignore file", error);
+					new Notice("Failed to load Seafile ignore file: " + (error as Error).message);
+				});
 			})
 			.addButton(button => button
 				.setButtonText("Save")
 				.onClick(async () => {
 					button.setDisabled(true);
-					settings.ignore = ignoreText.getValue();
-					this.plugin.sync.setIgnorePattern(settings.ignore);
-					await this.plugin.saveSettings();
-					new Notice("Ignore pattern saved");
-					button.setDisabled(false);
+					try {
+						await this.plugin.sync.writeIgnoreFile(ignoreText.getValue());
+						new Notice(`${SEAFILE_IGNORE_FILE} saved`);
+					} catch (error) {
+						new Notice("Failed to save Seafile ignore file: " + (error as Error).message);
+					} finally {
+						button.setDisabled(false);
+					}
 				}));
 
 		new Setting(containerEl)

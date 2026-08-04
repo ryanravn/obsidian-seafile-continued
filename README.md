@@ -21,13 +21,15 @@ This is a community continuation of [conql/obsidian-seafile](https://github.com/
 1. Open the plugin settings.
 2. Enter the URL of your Seafile server and log into your account.
 3. Choose the repository you want to sync. If it's encrypted, enter the passphrase when prompted.
-4. *Optional*: configure an ignore pattern. The syntax loosely follows [gitignore](https://git-scm.com/docs/gitignore). Test it before relying on it. The plugin folder and Obsidian configuration are always ignored.
+4. *Optional*: edit `seafile-ignore.txt` from the plugin settings or directly in the library root. It uses Seafile's standard ignore syntax and is shared with standard Seafile clients.
 5. Click "Enable" to start syncing.
 6. The plugin will now sync at the configured interval.
 
 To trigger a sync immediately, click "Sync now" in the settings, or run "Seafile: Sync now" from the command palette (assign it a hotkey if you use it often).
 
 Per-file sync status is shown next to file names in the explorer.
+
+`seafile-ignore.txt` is created automatically when absent. Its rules prevent new matching local files from being uploaded; files already present on the server may still be downloaded, matching standard Seafile client behavior. The plugin installation and its device-specific synchronization database are always protected internally.
 
 ## Notes
 
