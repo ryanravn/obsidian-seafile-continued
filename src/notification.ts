@@ -33,8 +33,8 @@ export function toWebSocketUrl(notificationUrl: string): string {
 
 export class SeafileNotificationClient {
 	private socket: WebSocket | null = null;
-	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-	private connectionTimer: ReturnType<typeof setTimeout> | null = null;
+	private reconnectTimer: number | null = null;
+	private connectionTimer: number | null = null;
 	private reconnectAttempt = 0;
 	private generation = 0;
 	private stopped = true;
@@ -75,7 +75,7 @@ export class SeafileNotificationClient {
 		this.stopped = true;
 		this.generation++;
 		if (this.reconnectTimer !== null) {
-			clearTimeout(this.reconnectTimer);
+			window.clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = null;
 		}
 		this.clearConnectionTimer();
@@ -126,7 +126,7 @@ export class SeafileNotificationClient {
 			socket.onclose = () => {
 				if (socket === this.socket) this.handleDisconnect(socket, generation);
 			};
-			this.connectionTimer = setTimeout(() => {
+			this.connectionTimer = window.setTimeout(() => {
 				if (socket === this.socket) this.handleDisconnect(socket, generation);
 			}, 15000);
 		} catch (error) {
@@ -185,7 +185,7 @@ export class SeafileNotificationClient {
 
 	private clearConnectionTimer(): void {
 		if (this.connectionTimer !== null) {
-			clearTimeout(this.connectionTimer);
+			window.clearTimeout(this.connectionTimer);
 			this.connectionTimer = null;
 		}
 	}
@@ -195,7 +195,7 @@ export class SeafileNotificationClient {
 		const delay = RECONNECT_DELAYS_MS[Math.min(this.reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)];
 		this.reconnectAttempt++;
 		this.setStatus({ type: "fallback", retryInSeconds: delay / 1000 });
-		this.reconnectTimer = setTimeout(() => {
+		this.reconnectTimer = window.setTimeout(() => {
 			this.reconnectTimer = null;
 			void this.connect(generation);
 		}, delay);

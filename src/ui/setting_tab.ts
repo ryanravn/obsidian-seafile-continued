@@ -1,4 +1,4 @@
-import { type App, type ButtonComponent, Notice, PluginSettingTab, Setting, type TextAreaComponent, type TextComponent } from "obsidian";
+import { type App, Notice, PluginSettingTab, type SettingDefinitionItem } from "obsidian";
 import type SeafilePlugin from "src/main";
 import { debug } from "src/utils";
 import { server } from "src/config";
@@ -13,468 +13,520 @@ import { resolveNotificationUrl, type NotificationStatus } from "src/notificatio
 import type { SyncStatus } from "src/sync/controller";
 import type { SyncStatusTextMode } from "src/settings";
 import { formatSyncActivity } from "./sync_progress";
+import { describeOnboardingStep, getOnboardingStep } from "./onboarding";
 
 export class SeafileSettingTab extends PluginSettingTab {
-	private unsubscribeNotificationStatus: (() => void) | null = null;
-	private unsubscribeSyncStatus: (() => void) | null = null;
-
 	constructor(public app: App, private readonly plugin: SeafilePlugin) {
 		super(app, plugin);
 	}
 
-	hide(): void {
-		this.unsubscribeNotificationStatus?.();
-		this.unsubscribeNotificationStatus = null;
-		this.unsubscribeSyncStatus?.();
-		this.unsubscribeSyncStatus = null;
-		super.hide();
+	getSettingDefinitions(): SettingDefinitionItem[] {
+		const settings = this.plugin.settings;
+		const repositoryUnavailable = this.plugin.sync.status.type === "stop" && this.plugin.sync.status.message === "repository-unavailable";
+		const onboardingStep = getOnboardingStep(settings);
+
+		return [
+			{
+				name: "Initialize from remote",
+				desc: describeOnboardingStep(onboardingStep),
+				aliases: ["setup", "onboarding", "new device", "existing vault"],
+				visible: () => getOnboardingStep(this.plugin.settings) !== "complete",
+				render: setting => {
+					if (onboardingStep === "host") {
+						let hostValue = settings.host;
+						setting.addText(text => text
+							.setPlaceholder("https://example.com")
+							.setValue(settings.host)
+							.onChange(value => { hostValue = value; }))
+							.addButton(button => button
+								.setButtonText("Save server")
+								.setCta()
+								.onClick(async () => { await this.saveHost(hostValue); }));
+						return;
+					}
+
+					if (onboardingStep === "account") {
+						setting.addButton(button => button
+							.setButtonText("Log in")
+							.setCta()
+							.onClick(() => { this.openLogin(false); }))
+							.addButton(button => button
+								.setButtonText("Use API token")
+								.onClick(() => { this.openLogin(true); }));
+						return;
+					}
+
+					if (onboardingStep === "repository") {
+						setting.addButton(button => button
+							.setButtonText("Choose remote library")
+							.setCta()
+							.onClick(() => { void this.chooseRepository(); }));
+						return;
+					}
+
+					if (onboardingStep === "sync") {
+						setting.addButton(button => button
+							.setButtonText("Start initial sync")
+							.setCta()
+							.onClick(async () => {
+								button.setDisabled(true);
+								try {
+									await this.plugin.enableSync();
+									new Notice("Initial synchronization started");
+									this.update();
+								} catch (error) {
+									new Notice("Failed to start initial sync: " + (error as Error).message);
+									debug.error(error);
+								} finally {
+									button.setDisabled(false);
+								}
+							}));
+					}
+				}
+			},
+			{
+				name: "Host",
+				desc: "Seafile server URL.",
+				aliases: ["server", "URL"],
+				render: setting => {
+					let hostValue = settings.host;
+					setting.addText(text => text
+						.setPlaceholder("https://example.com")
+						.setValue(settings.host)
+						.onChange(value => { hostValue = value; }))
+						.addButton(button => button
+							.setButtonText("Save")
+							.onClick(async () => { await this.saveHost(hostValue); }));
+				}
+			},
+			{
+				name: "Account",
+				desc: settings.account || "Not logged in.",
+				aliases: ["login", "logout", "API token", "SSO"],
+				render: setting => {
+					setting.addButton(button => button
+						.setButtonText(settings.account ? "Log out" : "Log in")
+						.onClick(async () => {
+							if (!settings.account) {
+								if (!settings.host) {
+									new Notice("Save the Seafile host first.");
+									return;
+								}
+								this.openLogin(false);
+								return;
+							}
+
+							const result = await this.askClearVault("To log out, you need to clear your vault first.\n\n");
+							if (!result) return;
+							const oldRepoId = settings.repoId;
+							settings.account = "";
+							settings.authToken = "";
+							settings.deviceName = "";
+							settings.deviceId = "";
+							this.clearRepositorySettings();
+							if (oldRepoId) await getPasswordStore(this.app).clear(oldRepoId);
+							await this.plugin.saveSettings();
+							this.update();
+						}))
+						.addButton(button => button
+							.setButtonText("Use API token")
+							.setDisabled(!!settings.account)
+							.onClick(() => {
+								if (!settings.host) {
+									new Notice("Save the Seafile host first.");
+									return;
+								}
+								this.openLogin(true);
+							}));
+				}
+			},
+			{
+				name: "Repository",
+				desc: repositoryUnavailable
+					? `${settings.repoName || "Configured repository"} is unavailable. Choose a replacement without deleting local files.`
+					: settings.repoName || "Choose a repository to sync.",
+				aliases: ["library", "remote repository"],
+				render: setting => {
+					setting.addButton(button => button
+						.setButtonText(repositoryUnavailable ? "Choose replacement" : "Choose")
+						.onClick(async () => { await this.chooseRepository(); }));
+				}
+			},
+			{
+				name: "Saved password",
+				desc: "Encrypted-repository password stored on this device.",
+				aliases: ["forget password", "keychain"],
+				visible: () => settings.encrypted && !!settings.repoId,
+				render: setting => {
+					const store = getPasswordStore(this.app);
+					setting.setDesc("Checking…");
+					setting.addButton(button => {
+						button.setButtonText("Forget").setDisabled(true);
+						button.onClick(async () => {
+							button.setDisabled(true);
+							await store.clear(settings.repoId);
+							setting.setDesc("No password saved on this device.");
+							new Notice("Saved password cleared");
+						});
+						void store.load(settings.repoId).then(stored => {
+							setting.setDesc(stored ? `Saved. ${store.description}` : "No password saved on this device.");
+							button.setDisabled(!stored);
+						});
+					});
+				}
+			},
+			{
+				name: "Sync status",
+				desc: this.describeSyncStatus(this.plugin.sync.status),
+				aliases: ["enable sync", "disable sync"],
+				render: setting => {
+					setting.addButton(button => button
+						.setButtonText(settings.enableSync ? "Disable" : "Enable")
+						.onClick(async () => {
+							button.setDisabled(true);
+							try {
+								if (settings.enableSync) {
+									await this.plugin.disableSync();
+									new Notice("Sync disabled");
+								} else if (this.plugin.checkSyncReady()) {
+									await this.plugin.enableSync();
+									new Notice("Sync enabled");
+								} else if (!settings.authToken) {
+									new Notice("Log in first before enabling sync");
+								} else if (!settings.repoToken) {
+									new Notice("Choose a repository first before enabling sync");
+								} else {
+									new Notice("Sync is not ready");
+								}
+							} catch (error) {
+								new Notice("Failed to change sync state: " + (error as Error).message);
+								debug.error(error);
+							} finally {
+								button.setDisabled(false);
+								button.setButtonText(settings.enableSync ? "Disable" : "Enable");
+							}
+						}));
+					return this.plugin.sync.subscribeStatus(status => {
+						setting.setDesc(this.describeSyncStatus(status));
+					});
+				}
+			},
+			{
+				name: "Sidebar status text",
+				desc: "Choose when text appears next to the sync button. The complete status is always available on hover.",
+				aliases: ["sync progress", "sync button"],
+				render: setting => {
+					setting.addDropdown(dropdown => dropdown
+						.addOption("always", "Always show")
+						.addOption("syncing", "Only while syncing")
+						.addOption("never", "Never show")
+						.setValue(settings.syncStatusTextMode)
+						.onChange(async value => {
+							settings.syncStatusTextMode = value as SyncStatusTextMode;
+							await this.plugin.saveSettings();
+							this.plugin.explorerView?.syncStatusChanged(this.plugin.sync.status);
+						}));
+				}
+			},
+			{
+				name: "Manual sync",
+				desc: "Trigger a sync immediately.",
+				aliases: ["sync now"],
+				render: setting => {
+					setting.addButton(button => button
+						.setButtonText("Sync now")
+						.onClick(async () => {
+							button.setDisabled(true);
+							try {
+								await this.plugin.triggerManualSync();
+							} finally {
+								button.setDisabled(false);
+							}
+						}));
+				}
+			},
+			{
+				name: "Realtime sync",
+				desc: this.describeNotificationStatus(this.plugin.notifications.status),
+				aliases: ["notifications", "WebSocket", "periodic fallback"],
+				render: setting => {
+					setting.addToggle(toggle => toggle
+						.setValue(settings.enableNotifications)
+						.onChange(async value => {
+							toggle.setDisabled(true);
+							try {
+								await this.plugin.setNotificationsEnabled(value);
+								setting.setDesc(this.describeNotificationStatus(this.plugin.notifications.status));
+							} finally {
+								toggle.setDisabled(false);
+							}
+						}));
+					return this.plugin.notifications.subscribeStatus(status => {
+						setting.setDesc(this.describeNotificationStatus(status));
+					});
+				}
+			},
+			{
+				name: "Notification server URL",
+				desc: `Leave blank to use ${resolveNotificationUrl(settings.host || "https://example.com", "")}.`,
+				aliases: ["realtime server", "WebSocket URL"],
+				render: setting => {
+					let notificationUrl = settings.notificationUrl;
+					setting.addText(text => text
+						.setPlaceholder("https://example.com/notification")
+						.setValue(settings.notificationUrl)
+						.onChange(value => { notificationUrl = value; }))
+						.addButton(button => button
+							.setButtonText("Save")
+							.onClick(async () => {
+								try {
+									const value = notificationUrl.trim();
+									if (value) resolveNotificationUrl(settings.host || value, value);
+									await this.plugin.setNotificationUrl(value);
+									new Notice("Notification server URL saved");
+									this.update();
+								} catch (error) {
+									new Notice((error as Error).message);
+								}
+							}));
+				}
+			},
+			{
+				name: "Sync interval",
+				desc: "Periodic synchronization interval in seconds.",
+				aliases: ["polling interval"],
+				render: setting => {
+					let interval = Math.floor(settings.interval / 1000).toString();
+					setting.addText(text => text
+						.setPlaceholder("30")
+						.setValue(interval)
+						.onChange(value => { interval = value; }))
+						.addButton(button => button
+							.setButtonText("Save")
+							.onClick(async () => {
+								const seconds = parseInt(interval);
+								if (isNaN(seconds) || seconds < 5) {
+									new Notice("Sync interval must be at least 5 seconds");
+									return;
+								}
+								settings.interval = seconds * 1000;
+								await this.plugin.saveSettings();
+								if (this.plugin.sync.status.type === "idle") this.plugin.sync.startSync();
+								new Notice("Sync interval saved");
+								this.update();
+							}));
+				}
+			},
+			{
+				name: "Seafile ignore file",
+				desc: `Edit ${SEAFILE_IGNORE_FILE} in the library root. The same rules are used by standard Seafile clients; the plugin creates this file automatically when necessary.`,
+				aliases: ["ignore list", "excluded files", "git folder"],
+				render: setting => {
+					let ignoreContents = "";
+					setting.addTextArea(text => {
+						text.setPlaceholder("Loading ignore rules…");
+						text.inputEl.rows = 12;
+						text.onChange(value => { ignoreContents = value; });
+						void this.plugin.sync.readIgnoreFile().then(contents => {
+							ignoreContents = contents;
+							text.setValue(contents);
+						}).catch(error => {
+							debug.error("Failed to load Seafile ignore file", error);
+							new Notice("Failed to load Seafile ignore file: " + (error as Error).message);
+						});
+					}).addButton(button => button
+						.setButtonText("Save")
+						.onClick(async () => {
+							button.setDisabled(true);
+							try {
+								await this.plugin.sync.writeIgnoreFile(ignoreContents);
+								new Notice(`${SEAFILE_IGNORE_FILE} saved`);
+							} catch (error) {
+								new Notice("Failed to save Seafile ignore file: " + (error as Error).message);
+							} finally {
+								button.setDisabled(false);
+							}
+						}));
+				}
+			},
+			{
+				name: "Dev mode",
+				desc: "Enable development logging, including sync phase timings and throughput. Restart required.",
+				aliases: ["debug logging", "performance metrics"],
+				render: setting => {
+					setting.addToggle(toggle => toggle
+						.setValue(settings.devMode)
+						.onChange(async value => {
+							settings.devMode = value;
+							await this.plugin.saveSettings();
+						}));
+				}
+			},
+			{
+				name: "Use fetch",
+				desc: "Use fetch instead of the Obsidian request API. Requires CORS on the Seafile server.",
+				aliases: ["CORS", "large file transfers"],
+				render: setting => {
+					setting.addToggle(toggle => toggle
+						.setValue(settings.useFetch)
+						.onChange(async value => {
+							settings.useFetch = value;
+							await this.plugin.saveSettings();
+						}));
+				}
+			},
+			{
+				name: "Clear vault",
+				desc: "Delete all local files and synchronization data. Try this only when recovering from sync problems.",
+				aliases: ["reset sync", "delete local files"],
+				render: setting => {
+					setting.addButton(button => button
+						.setButtonText("Clear")
+						.setDestructive()
+						.onClick(async () => {
+							if (await this.askClearVault()) this.update();
+						}));
+				}
+			}
+		];
 	}
 
-	display(): void {
-		this.unsubscribeNotificationStatus?.();
-		this.unsubscribeNotificationStatus = null;
-		this.unsubscribeSyncStatus?.();
-		this.unsubscribeSyncStatus = null;
-		const settings = this.plugin.settings;
-		const { containerEl } = this;
-		containerEl.empty();
+	private async saveHost(value: string): Promise<void> {
+		try {
+			const url = new URL(value);
+			if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Invalid protocol");
+			this.plugin.settings.host = url.origin;
+			await this.plugin.saveSettings();
+			this.plugin.refreshNotifications();
+			new Notice("Host saved");
+			this.update();
+		} catch (error) {
+			new Notice((error as Error).message);
+		}
+	}
 
-		let hostText: TextComponent;
-		new Setting(containerEl)
-			.setName("Host")
-			.setDesc("Server URL.")
-			.addText(text => {
-				hostText = text;
-				text.setPlaceholder("https://example.com");
-				text.setValue(settings.host);
-			})
-			.addButton(button => button
-				.setButtonText("Save")
-				.onClick(async () => {
-					try {
-						const url = new URL(hostText.getValue());
-						if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Invalid protocol");
-						settings.host = url.origin;
-						await this.plugin.saveSettings();
-						this.plugin.refreshNotifications();
-						new Notice("Host saved");
-					} catch (error) {
-						new Notice((error as Error).message);
-					}
-					hostText.setValue(settings.host);
-				})
-			);
-		const accountDefaultDesc = "Not logged in.";
-		let accountButton: ButtonComponent;
-		let tokenButton: ButtonComponent;
-		const accountSetting = new Setting(containerEl)
-			.setName("Account")
-			.setDesc(settings.account ? settings.account : accountDefaultDesc)
-			.addButton(button => {
-				accountButton = button;
-				if (settings.account) { button.setButtonText("Log out"); } else { button.setButtonText("Log in"); }
+	private openLogin(useToken: boolean): void {
+		if (!this.plugin.settings.host) {
+			new Notice("Save the Seafile host first.");
+			return;
+		}
 
-				button.onClick(async () => {
-					if (settings.account) {
-						// Log out
-						const result = await this.askClearVault("To log out, you need to clear your vault first.\n\n");
-						if (!result) return;
-
-						const oldRepoId = settings.repoId;
-						settings.account = "";
-						settings.authToken = "";
-						settings.deviceName = "";
-						settings.deviceId = "";
-						settings.repoName = "";
-						settings.repoId = "";
-						settings.repoToken = "";
-						settings.encrypted = false;
-						settings.encVersion = 0;
-						settings.repoSalt = "";
-						settings.repoMagic = "";
-						settings.randomKey = "";
-						server.crypto = null;
-						if (oldRepoId) await getPasswordStore(this.app).clear(oldRepoId);
-						await this.plugin.saveSettings();
-						accountButton.setButtonText("Log in");
-						tokenButton.setDisabled(false);
-						accountSetting.setDesc(accountDefaultDesc);
-						repoSetting.setDesc(repoDefaultDesc);
-					} else {
-						// Login
-						if (!settings.host) {
-							new Notice("Save the Seafile host first.");
-							return;
-						}
-						new LoginModal(this.app, applyLogin).open();
-					}
-				});
-			})
-			.addButton(button => {
-				tokenButton = button;
-				button.setButtonText("Use API token")
-					.setDisabled(!!settings.account)
-					.onClick(() => {
-						if (!settings.host) {
-							new Notice("Save the Seafile host first.");
-							return;
-						}
-						new TokenLoginModal(this.app, applyLogin).open();
-					});
-			});
 		const applyLogin = async (account: string, token: string, deviceName: string, deviceId: string): Promise<void> => {
+			const settings = this.plugin.settings;
 			settings.account = account;
 			settings.authToken = token;
 			settings.deviceName = deviceName;
 			settings.deviceId = deviceId;
 			await this.plugin.saveSettings();
-
-			accountButton.setButtonText("Log out");
-			tokenButton.setDisabled(true);
-			accountSetting.setDesc(account);
+			this.update();
 		};
-		const repoDefaultDesc = "Choose a repository to sync.";
-		const repositoryUnavailable = this.plugin.sync.status.type === "stop" && this.plugin.sync.status.message === "repository-unavailable";
-		let repoButton: ButtonComponent;
-		const repoSetting = new Setting(containerEl)
-			.setName("Repository")
-			.setDesc(repositoryUnavailable
-				? `${settings.repoName || "Configured repository"} is unavailable. Choose a replacement without deleting local files.`
-				: settings.repoName ? settings.repoName : repoDefaultDesc)
-			.addButton(button => {
-				repoButton = button;
-				button.setButtonText(repositoryUnavailable ? "Choose replacement" : "Choose");
-				button.onClick(async () => {
-					if (!settings.authToken) {
-						new Notice("Log in first before choosing a repository");
-						return;
-					}
-					const preserveVault = this.plugin.sync.status.type === "stop" && this.plugin.sync.status.message === "repository-unavailable";
-					const oldRepoId = settings.repoId;
-					if (settings.repoToken && !preserveVault) {
-						const result = await this.askClearVault("To change repository, you need to clear your vault first.\n\n");
-						if (!result) return;
 
-						const oldRepoId = settings.repoId;
-						settings.repoName = "";
-						settings.repoId = "";
-						settings.repoToken = "";
-						settings.encrypted = false;
-						settings.encVersion = 0;
-						settings.repoSalt = "";
-						settings.repoMagic = "";
-						settings.randomKey = "";
-						server.crypto = null;
-						if (oldRepoId) await getPasswordStore(this.app).clear(oldRepoId);
-						repoSetting.setDesc(repoDefaultDesc);
-						await this.plugin.saveSettings();
-					}
-					new RepoModal(this.app, async ({ repoName, repoId, info }) => {
-						const replacingRepository = preserveVault && repoId !== oldRepoId;
-						const applyAndStart = async () => {
-							if (replacingRepository) {
-								await this.plugin.resetSyncForRepositoryChange();
-								if (oldRepoId) await getPasswordStore(this.app).clear(oldRepoId);
-							}
-							settings.repoName = repoName;
-							settings.repoId = repoId;
-							settings.repoToken = info.token;
-							settings.encrypted = info.encrypted;
-							settings.encVersion = info.enc_version;
-							settings.repoSalt = info.salt;
-							settings.repoMagic = info.magic;
-							settings.randomKey = info.random_key;
-							repoSetting.setDesc(repoName);
-							repoButton.setButtonText("Choose");
-							await this.plugin.saveSettings();
-							if (settings.enableSync) await this.plugin.enableSync();
-							if (replacingRepository) new Notice("Repository changed. Local vault files were preserved.");
-						};
+		if (useToken) new TokenLoginModal(this.app, applyLogin).open();
+		else new LoginModal(this.app, applyLogin).open();
+	}
 
-						if (info.encrypted) {
-							if (info.enc_version !== 2 && info.enc_version !== 4) {
-								new Notice(`Encryption version ${info.enc_version} is not supported. Only v2 and v4 work.`);
-								return;
-							}
-							new PasswordModal(this.app, {
-								repoId,
-								encVersion: info.enc_version,
-								repoSalt: info.salt,
-								magic: info.magic,
-								randomKey: info.random_key
-							}, async (crypto, password, remember) => {
-								server.crypto = crypto;
-								if (remember) {
-									try {
-										await getPasswordStore(this.app).save(repoId, password);
-									} catch (e) {
-										new Notice("Could not save password: " + (e as Error).message);
-										debug.error(e);
-									}
-								}
-								await applyAndStart();
-							}).open();
-						} else {
-							server.crypto = null;
-							await applyAndStart();
-						}
-					}).open();
-				});
-			});
-
-		if (settings.encrypted && settings.repoId) {
-			const store = getPasswordStore(this.app);
-			const savedPasswordSetting = new Setting(containerEl)
-				.setName("Saved password")
-				.setDesc("Checking...");
-
-			let forgetBtn!: ButtonComponent;
-			savedPasswordSetting.addButton(button => {
-				forgetBtn = button;
-				button.setButtonText("Forget").setDisabled(true);
-				button.onClick(async () => {
-					button.setDisabled(true);
-					await store.clear(settings.repoId);
-					savedPasswordSetting.setDesc("No password saved on this device.");
-					new Notice("Saved password cleared");
-				});
-			});
-
-			void (async () => {
-				const stored = await store.load(settings.repoId);
-				if (stored) {
-					savedPasswordSetting.setDesc(`Saved. ${store.description}`);
-					forgetBtn.setDisabled(false);
-				} else {
-					savedPasswordSetting.setDesc("No password saved on this device.");
-				}
-			})();
+	private async chooseRepository(): Promise<void> {
+		const settings = this.plugin.settings;
+		if (!settings.authToken) {
+			new Notice("Log in first before choosing a repository");
+			return;
 		}
 
-		const describeSyncStatus = (status: SyncStatus): string => {
-			if (!settings.enableSync) return "Disabled";
-			if (status.type === "busy") return formatSyncActivity(status);
-			if (status.type === "idle" && status.error) return `Retry scheduled: ${status.error}`;
-			if (status.type === "idle") return "Enabled and waiting for changes";
-			if (status.message === "repository-unavailable") return "Stopped because the configured repository is unavailable. Local files were preserved.";
-			if (status.message === "error") return "Stopped after repeated sync failures";
-			return "Enabled, but synchronization is stopped";
-		};
-		let enableSyncButton: ButtonComponent;
-		const enableSyncSetting = new Setting(containerEl)
-			.setName("Sync status")
-			.setDesc(describeSyncStatus(this.plugin.sync.status))
-			.addButton(button => {
-				enableSyncButton = button;
-				button.setButtonText(settings.enableSync ? "Disable" : "Enable");
-				button.onClick(async () => {
-					button.setDisabled(true);
-					try {
-						if (settings.enableSync) {
-							// Disable sync
-							await this.plugin.disableSync();
-							new Notice("Sync disabled");
-							button.setButtonText("Enable");
-						} else {
-							// Enable sync
-							if (this.plugin.checkSyncReady()) {
-								await this.plugin.enableSync();
-								new Notice("Sync enabled");
-								button.setButtonText("Disable");
-							} else {
-								if (settings.authToken) {
-									if (!settings.repoToken) {
-										new Notice("Choose a repository first before enabling sync");
-									} else {
-										new Notice("Sync is not ready");
-									}
-								} else {
-									new Notice("Log in first before enabling sync");
-								}
-							}
-						}
-					} catch (error) {
-						new Notice("Failed to change sync state: " + (error as Error).message);
-						debug.error(error);
-					} finally {
-						button.setDisabled(false);
-					}
-				});
-			});
-		this.unsubscribeSyncStatus = this.plugin.sync.subscribeStatus(status => {
-			enableSyncSetting.setDesc(describeSyncStatus(status));
-		});
+		const preserveVault = this.plugin.sync.status.type === "stop" && this.plugin.sync.status.message === "repository-unavailable";
+		const oldRepoId = settings.repoId;
+		if (settings.repoToken && !preserveVault) {
+			const result = await this.askClearVault("To change repository, you need to clear your vault first.\n\n");
+			if (!result) return;
+			this.clearRepositorySettings();
+			if (oldRepoId) await getPasswordStore(this.app).clear(oldRepoId);
+			await this.plugin.saveSettings();
+			this.update();
+		}
 
-		new Setting(containerEl)
-			.setName("Sidebar status text")
-			.setDesc("Choose when text appears next to the sync button. The complete status is always available on hover.")
-			.addDropdown(dropdown => dropdown
-				.addOption("always", "Always show")
-				.addOption("syncing", "Only while syncing")
-				.addOption("never", "Never show")
-				.setValue(settings.syncStatusTextMode)
-				.onChange(async value => {
-					settings.syncStatusTextMode = value as SyncStatusTextMode;
-					await this.plugin.saveSettings();
-					this.plugin.explorerView?.syncStatusChanged(this.plugin.sync.status);
-				}));
+		new RepoModal(this.app, async ({ repoName, repoId, info }) => {
+			const replacingRepository = preserveVault && repoId !== oldRepoId;
+			const applyAndStart = async () => {
+				if (replacingRepository) {
+					await this.plugin.resetSyncForRepositoryChange();
+					if (oldRepoId) await getPasswordStore(this.app).clear(oldRepoId);
+				}
+				settings.repoName = repoName;
+				settings.repoId = repoId;
+				settings.repoToken = info.token;
+				settings.encrypted = info.encrypted;
+				settings.encVersion = info.enc_version;
+				settings.repoSalt = info.salt;
+				settings.repoMagic = info.magic;
+				settings.randomKey = info.random_key;
+				await this.plugin.saveSettings();
+				if (settings.enableSync) await this.plugin.enableSync();
+				if (replacingRepository) new Notice("Repository changed. Local vault files were preserved.");
+				this.update();
+			};
 
-		new Setting(containerEl)
-			.setName("Manual sync")
-			.setDesc("Trigger a sync immediately.")
-			.addButton(button => button
-				.setButtonText("Sync now")
-				.onClick(async () => {
-					button.setDisabled(true);
-					try {
-						await this.plugin.triggerManualSync();
-					} finally {
-						button.setDisabled(false);
-					}
-				})
-			);
-
-		const describeNotificationStatus = (status: NotificationStatus): string => {
-			if (this.plugin.sync.status.type === "stop" && this.plugin.sync.status.message === "repository-unavailable") {
-				return "Stopped because the configured repository is unavailable. Local files were preserved.";
+			if (!info.encrypted) {
+				server.crypto = null;
+				await applyAndStart();
+				return;
 			}
-			if (!settings.enableNotifications) return "Disabled. Periodic synchronization remains active.";
-			if (!settings.enableSync) return "Waiting for synchronization to be enabled.";
-			if (status.type === "connected") return "Connected. Remote library updates trigger synchronization immediately.";
-			if (status.type === "connecting") return "Connecting to the notification server…";
-			if (status.type === "fallback") return `Unavailable. Retrying in ${status.retryInSeconds} seconds; periodic synchronization remains active.`;
-			return "Waiting to connect. Periodic synchronization remains active.";
-		};
-		const notificationSetting = new Setting(containerEl)
-			.setName("Realtime sync")
-			.setDesc(describeNotificationStatus(this.plugin.notifications.status))
-			.addToggle(toggle => toggle
-				.setValue(settings.enableNotifications)
-				.onChange(async value => {
-					toggle.setDisabled(true);
+			if (info.enc_version !== 2 && info.enc_version !== 4) {
+				new Notice(`Encryption version ${info.enc_version} is not supported. Only v2 and v4 work.`);
+				return;
+			}
+			new PasswordModal(this.app, {
+				repoId,
+				encVersion: info.enc_version,
+				repoSalt: info.salt,
+				magic: info.magic,
+				randomKey: info.random_key
+			}, async (crypto, password, remember) => {
+				server.crypto = crypto;
+				if (remember) {
 					try {
-						await this.plugin.setNotificationsEnabled(value);
-						notificationSetting.setDesc(describeNotificationStatus(this.plugin.notifications.status));
-					} finally {
-						toggle.setDisabled(false);
-					}
-				}));
-		this.unsubscribeNotificationStatus = this.plugin.notifications.subscribeStatus(status => {
-			notificationSetting.setDesc(describeNotificationStatus(status));
-		});
-
-		let notificationUrlText: TextComponent;
-		new Setting(containerEl)
-			.setName("Notification server URL")
-			.setDesc(`Leave blank to use ${resolveNotificationUrl(settings.host || "https://example.com", "")}.`)
-			.addText(text => {
-				notificationUrlText = text;
-				text.setPlaceholder("https://example.com/notification");
-				text.setValue(settings.notificationUrl);
-			})
-			.addButton(button => button
-				.setButtonText("Save")
-				.onClick(async () => {
-					try {
-						const value = notificationUrlText.getValue().trim();
-						if (value) resolveNotificationUrl(settings.host || value, value);
-						await this.plugin.setNotificationUrl(value);
-						new Notice("Notification server URL saved");
+						await getPasswordStore(this.app).save(repoId, password);
 					} catch (error) {
-						new Notice((error as Error).message);
+						new Notice("Could not save password: " + (error as Error).message);
+						debug.error(error);
 					}
-					notificationUrlText.setValue(settings.notificationUrl);
-				}));
+				}
+				await applyAndStart();
+			}).open();
+		}).open();
+	}
 
-		let intervalText: TextComponent;
-		new Setting(containerEl)
-			.setName("Sync interval")
-			.setDesc("in seconds.")
-			.addText(text => {
-				intervalText = text;
-				text.setPlaceholder("30");
-				text.setValue(Math.floor(settings.interval / 1000).toString());
-			})
-			.addButton(button => button
-				.setButtonText("Save")
-				.onClick(async () => {
-					const seconds = parseInt(intervalText.getValue());
-					if (isNaN(seconds) || seconds < 5) {
-						new Notice("Sync interval must be at least 5 seconds");
-					} else {
-						settings.interval = seconds * 1000;
-						await this.plugin.saveSettings();
-						if (this.plugin.sync.status.type === "idle") { this.plugin.sync.startSync(); }
-						new Notice("Sync interval saved");
-					}
-					intervalText.setValue(Math.floor(settings.interval / 1000).toString());
-				})
-			);
+	private clearRepositorySettings(): void {
+		const settings = this.plugin.settings;
+		settings.repoName = "";
+		settings.repoId = "";
+		settings.repoToken = "";
+		settings.encrypted = false;
+		settings.encVersion = 0;
+		settings.repoSalt = "";
+		settings.repoMagic = "";
+		settings.randomKey = "";
+		server.crypto = null;
+	}
 
-		let ignoreText: TextAreaComponent;
-		new Setting(containerEl)
-			.setName("Seafile ignore file")
-			.setDesc(`Edit ${SEAFILE_IGNORE_FILE} in the library root. The same rules are used by standard Seafile clients; the plugin creates this file automatically when necessary.`)
-			.addTextArea(text => {
-				ignoreText = text;
-				text.setPlaceholder("Loading ignore rules…");
-				text.inputEl.rows = 12;
-				void this.plugin.sync.readIgnoreFile().then(contents => {
-					ignoreText.setValue(contents);
-				}).catch(error => {
-					debug.error("Failed to load Seafile ignore file", error);
-					new Notice("Failed to load Seafile ignore file: " + (error as Error).message);
-				});
-			})
-			.addButton(button => button
-				.setButtonText("Save")
-				.onClick(async () => {
-					button.setDisabled(true);
-					try {
-						await this.plugin.sync.writeIgnoreFile(ignoreText.getValue());
-						new Notice(`${SEAFILE_IGNORE_FILE} saved`);
-					} catch (error) {
-						new Notice("Failed to save Seafile ignore file: " + (error as Error).message);
-					} finally {
-						button.setDisabled(false);
-					}
-				}));
+	private describeSyncStatus(status: SyncStatus): string {
+		if (!this.plugin.settings.enableSync) return "Disabled";
+		if (status.type === "busy") return formatSyncActivity(status);
+		if (status.type === "idle" && status.error) return `Retry scheduled: ${status.error}`;
+		if (status.type === "idle") return "Enabled and waiting for changes";
+		if (status.message === "repository-unavailable") return "Stopped because the configured repository is unavailable. Local files were preserved.";
+		if (status.message === "error") return "Stopped after repeated sync failures";
+		return "Enabled, but synchronization is stopped";
+	}
 
-		new Setting(containerEl)
-			.setName("Dev mode")
-			.setDesc("Enable development logging, including sync phase timings and throughput. Restart required.")
-			.addToggle(toggle => toggle
-				.setValue(settings.devMode)
-				.onChange(async (value) => {
-					settings.devMode = value;
-					await this.plugin.saveSettings();
-				})
-			);
-		new Setting(containerEl)
-			.setName("Use fetch")
-			.setDesc("Use fetch instead of Obsidian API. Need CORS enabled on the server.")
-			.addToggle(toggle => toggle
-				.setValue(settings.useFetch)
-				.onChange(async (value) => {
-					settings.useFetch = value;
-					await this.plugin.saveSettings();
-				})
-			);
-		new Setting(containerEl)
-			.setName("Clear vault")
-			.setDesc("Delete all local files and data. Try this if you encounter any issues.")
-			.addButton(button => button
-				.setButtonText("Clear")
-				.setDestructive()
-				.onClick(async () => {
-					const success = await this.askClearVault();
-					if (success) {
-						// Sync has been disabled, update the UI
-						enableSyncSetting.setDesc("Disabled");
-						enableSyncButton.setButtonText("Enable");
-					}
-				})
-			);
+	private describeNotificationStatus(status: NotificationStatus): string {
+		if (this.plugin.sync.status.type === "stop" && this.plugin.sync.status.message === "repository-unavailable") {
+			return "Stopped because the configured repository is unavailable. Local files were preserved.";
+		}
+		if (!this.plugin.settings.enableNotifications) return "Disabled. Periodic synchronization remains active.";
+		if (!this.plugin.settings.enableSync) return "Waiting for synchronization to be enabled.";
+		if (status.type === "connected") return "Connected. Remote library updates trigger synchronization immediately.";
+		if (status.type === "connecting") return "Connecting to the notification server…";
+		if (status.type === "fallback") return `Unavailable. Retrying in ${status.retryInSeconds} seconds; periodic synchronization remains active.`;
+		return "Waiting to connect. Periodic synchronization remains active.";
 	}
 
 	private async askClearVault(info: string = ""): Promise<boolean> {

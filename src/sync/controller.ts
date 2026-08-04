@@ -53,6 +53,19 @@ interface FileUpload {
   blockIds: string[]
 }
 
+interface DesktopFileHandle {
+	read(buffer: Uint8Array, offset: number, length: number, position: number): Promise<{ bytesRead: number }>
+	close(): Promise<void>
+}
+
+interface DesktopFsPromises {
+	open(path: string, flags: "r"): Promise<DesktopFileHandle>
+}
+
+function isDesktopFsPromises(value: unknown): value is DesktopFsPromises {
+	return typeof value === "object" && value !== null && "open" in value && typeof value.open === "function";
+}
+
 interface SyncMetrics {
   startedAt: number
   preparedBytes: number
@@ -385,8 +398,15 @@ export class SyncController {
 			// dynamic import leaves `import("fs/promises")` in the bundle, which its
 			// plugin loader cannot resolve. A conditional require uses the loader's
 			// existing Node integration and remains unexecuted on mobile.
-			const { open } = require("fs/promises") as typeof import("fs/promises");
-			const handle = await open(this.adapter.getFullPath(path), "r");
+			const loadNodeModule = (window as unknown as { require?: (module: string) => unknown }).require;
+			if (typeof loadNodeModule !== "function") {
+				throw new Error("Desktop filesystem access is unavailable in this Obsidian window.");
+			}
+			const fsPromises = loadNodeModule("fs/promises");
+			if (!isDesktopFsPromises(fsPromises)) {
+				throw new Error("Obsidian returned an invalid desktop filesystem module.");
+			}
+			const handle = await fsPromises.open(this.adapter.getFullPath(path), "r");
 			try {
 				for (let index = 0; index < blockCount; index++) {
 					if (indices && !indices.has(index)) continue;
@@ -1240,7 +1260,7 @@ export class SyncController {
 			));
 		}
 		if (!reportedFiles) {
-			for (const _upload of fileUploads) this.reportUploadedFile();
+			for (let index = 0; index < fileUploads.length; index++) this.reportUploadedFile();
 		}
 		if (missing.size > 0) {
 			const id = missing.values().next().value as string;

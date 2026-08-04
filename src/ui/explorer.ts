@@ -72,12 +72,9 @@ export class Explorer {
 			void this.fileItemChanged(this.fileItems[path], path);
 		}
 
-		this.statusContainter = activeDocument.createElement("div");
-		this.statusContainter.classList.add(styles.syncStatus);
+		this.statusContainter = this.fileExplorer.containerEl.createDiv({ cls: styles.syncStatus });
 
-		this.statusIcon = activeDocument.createElement("div");
-		this.statusIcon.classList.add("nav-action-button");
-		this.statusIcon.classList.add("clickable-icon");
+		this.statusIcon = this.statusContainter.createDiv({ cls: ["nav-action-button", "clickable-icon"] });
 		this.statusIcon.addEventListener("click", () => {
 			void (async () => {
 				if (!this.plugin.settings.enableSync) {
@@ -90,11 +87,7 @@ export class Explorer {
 				}
 			})();
 		});
-		this.statusContainter.prepend(this.statusIcon);
-
-		this.statusText = activeDocument.createElement("div");
-		this.statusText.classList.add(styles.syncStatusText);
-		this.statusContainter.appendChild(this.statusText);
+		this.statusText = this.statusContainter.createDiv({ cls: styles.syncStatusText });
 
 		this.fileExplorer.containerEl.getElementsByClassName("nav-files-container")[0].after(this.statusContainter);
 		this.syncStatusChanged(this.sync.status);
@@ -142,9 +135,7 @@ export class Explorer {
 	private renderFileItem(item: FileItem, state: SyncState): void {
 		if (!item.iconWrapper) {
 			// Create icon wrapper div
-			const iconWrapper = activeDocument.createElement("div");
-			iconWrapper.classList.add(styles.nodeState);
-			item.selfEl.appendChild(iconWrapper);
+			const iconWrapper = item.selfEl.createDiv({ cls: styles.nodeState });
 			item.iconWrapper = iconWrapper;
 		}
 
