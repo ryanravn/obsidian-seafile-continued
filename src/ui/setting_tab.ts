@@ -7,6 +7,7 @@ import Dialog from "./dialog_modal";
 import LoginModal from "./login_modal";
 import PasswordModal from "./password_modal";
 import RepoModal from "./repo_modal";
+import TokenLoginModal from "./token_login_modal";
 
 export class SeafileSettingTab extends PluginSettingTab {
 	constructor(public app: App, private readonly plugin: SeafilePlugin) {
@@ -44,6 +45,7 @@ export class SeafileSettingTab extends PluginSettingTab {
 			);
 		const accountDefaultDesc = "Not logged in.";
 		let accountButton: ButtonComponent;
+		let tokenButton: ButtonComponent;
 		const accountSetting = new Setting(containerEl)
 			.setName("Account")
 			.setDesc(settings.account ? settings.account : accountDefaultDesc)
@@ -74,24 +76,42 @@ export class SeafileSettingTab extends PluginSettingTab {
 						if (oldRepoId) await getPasswordStore(this.app).clear(oldRepoId);
 						await this.plugin.saveSettings();
 						accountButton.setButtonText("Log in");
+						tokenButton.setDisabled(false);
 						accountSetting.setDesc(accountDefaultDesc);
 						repoSetting.setDesc(repoDefaultDesc);
 					} else {
 						// Login
-						new LoginModal(this.app, async (account, token, deviceName, deviceId) => {
-							settings.account = account;
-							settings.authToken = token;
-							settings.deviceName = deviceName;
-							settings.deviceId = deviceId;
-							await this.plugin.saveSettings();
-
-							accountButton.setButtonText("Log out");
-							accountSetting.setDesc(account);
-						}).open();
+						if (!settings.host) {
+							new Notice("Save the Seafile host first.");
+							return;
+						}
+						new LoginModal(this.app, applyLogin).open();
 					}
 				});
+			})
+			.addButton(button => {
+				tokenButton = button;
+				button.setButtonText("Use API token")
+					.setDisabled(!!settings.account)
+					.onClick(() => {
+						if (!settings.host) {
+							new Notice("Save the Seafile host first.");
+							return;
+						}
+						new TokenLoginModal(this.app, applyLogin).open();
+					});
 			});
+		const applyLogin = async (account: string, token: string, deviceName: string, deviceId: string): Promise<void> => {
+			settings.account = account;
+			settings.authToken = token;
+			settings.deviceName = deviceName;
+			settings.deviceId = deviceId;
+			await this.plugin.saveSettings();
 
+			accountButton.setButtonText("Log out");
+			tokenButton.setDisabled(true);
+			accountSetting.setDesc(account);
+		};
 		const repoDefaultDesc = "Choose a repository to sync.";
 		const repoSetting = new Setting(containerEl)
 			.setName("Repository")

@@ -359,15 +359,30 @@ export default class Server {
 	}
 
 	async getRepoList (): Promise<Repo[]> {
+		return await this.getRepoListWithToken(this.settings.authToken);
+	}
+
+	async validateAuthToken(authToken: string): Promise<void> {
+		const token = authToken.trim();
+		if (!token) throw new Error("API token is required.");
+
+		await this.getRepoListWithToken(token);
+	}
+
+	private async getRepoListWithToken(authToken: string): Promise<Repo[]> {
 		const resp = await this.sendRequest({
 			url: `${this.settings.host}/api/v2.1/repos/`,
 			headers: {
-				Authorization: `Token ${this.settings.authToken}`
+				Authorization: `Token ${authToken}`
 			},
 			responseType: "json"
-		}) as { repos: Repo[] };
+		}) as { repos?: unknown };
 
-		return resp.repos;
+		if (!Array.isArray(resp.repos)) {
+			throw new Error("The server returned an unexpected repository response.");
+		}
+
+		return resp.repos as Repo[];
 	}
 
 	async getRepoToken (repoId: string): Promise<string> {
