@@ -210,6 +210,9 @@ export class Explorer {
 			else if (status.message == "error") {
 				this.setStatus("alert-circle", "Error");
 			}
+			else if (status.message == "safety" || status.message == "preflight") {
+				this.setStatus("shield-alert", status.error ?? "Sync paused by a safety check");
+			}
 			else {
 				this.setStatus("refresh-cw-off", "Sync stopped");
 			}

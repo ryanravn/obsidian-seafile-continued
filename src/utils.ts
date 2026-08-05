@@ -84,10 +84,10 @@ export function memoizeWithLimit<T extends unknown[], V>(fn: Func<T, V>, cacheLi
 
 // Pack multiple requests into a single request
 export function packRequest<FuncParamType, FuncRetType>
-	(
-		packFunc: (funcParamArray: FuncParamType[]) => Promise<Map<FuncParamType, FuncRetType>>,
-		limit: number, interval: number, batchSize: number
-	): (key: FuncParamType) => Promise<FuncRetType> {
+(
+	packFunc: (funcParamArray: FuncParamType[]) => Promise<Map<FuncParamType, FuncRetType>>,
+	limit: number, interval: number, batchSize: number
+): (key: FuncParamType) => Promise<FuncRetType> {
 	interface callback { resolve: (value: FuncRetType) => void, reject: (reason: unknown) => void }
 	const taskQueue = new Map<FuncParamType, Array<{ callback: callback, stack: string }>>();
 	const throttled = pThrottle({ limit, interval })(async () => {

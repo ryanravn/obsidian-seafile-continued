@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, jest, test } from "@jest/globals";
 import { rm } from "fs/promises";
 import { DOWNLOAD_JOURNAL_PATH, initConfig, SYNC_DLOG_PATH } from "../config";
-import { MODE_FILE, TYPE_FILE, type FileSeafDirent, type FileSeafFs } from "../server";
+import { MODE_DIR, MODE_FILE, TYPE_FILE, type DirSeafDirent, type FileSeafDirent, type FileSeafFs } from "../server";
 import { SyncController, type NodeChange } from "../sync/controller";
 import { SyncNode } from "../sync/node";
+import { debug } from "../utils";
 
 const originalPath = "atomic-note.md";
 
@@ -218,5 +219,78 @@ describe("sync data safety", () => {
 		expect(conflict).toBeDefined();
 		expect(await global.app.vault.adapter.read(conflict!)).toBe("local changes");
 		expect(changes.some(change => change.type === "add" && change.node.path.includes("SFConflict"))).toBe(true);
+	});
+
+	test("clears a stale pending root when reconciliation finds identical content", async () => {
+		const sync = setupServer({ block_ids: [], size: 0, type: TYPE_FILE, version: 1 }, {});
+		const remote: DirSeafDirent = { id: "root-id", mode: MODE_DIR, mtime: 1700000000, name: "" };
+		const childRemote: DirSeafDirent = { id: "child-id", mode: MODE_DIR, mtime: remote.mtime, name: "child" };
+		const root = await SyncNode.deserialize("", {
+			prev: remote,
+			children: { child: { prev: childRemote, children: {} } }
+		});
+		root.prevDirty = false;
+		root.setNext({ ...remote, mtime: remote.mtime - 1 }, false);
+		root.children.child.setNext({ ...childRemote, mtime: childRemote.mtime - 1 }, false);
+
+		await sync.pull([], "", root, remote);
+
+		expect(root.next).toBeUndefined();
+		expect(root.children.child.next).toBeUndefined();
+		expect(root.state.type).toBe("sync");
+	});
+
+	test("does not let plugin state writes dirty the vault root", async () => {
+		const sync = setupServer({ block_ids: [], size: 0, type: TYPE_FILE, version: 1 }, {});
+		await sync.init();
+		const internal = sync as unknown as { nodeRoot: SyncNode };
+		internal.nodeRoot.prevDirty = false;
+
+		await sync.notifyChange("/.obsidian/plugins/seafile/sync_dlog", "modify");
+
+		expect(internal.nodeRoot.prevDirty).toBe(false);
+	});
+
+	test("does not publish a stale pending root without semantic changes", async () => {
+		const warn = jest.spyOn(debug, "warn").mockImplementation(() => undefined);
+		const adapter = global.app.vault.adapter;
+		const createCommit = jest.fn(async () => { throw new Error("must not create a commit"); });
+		const fakeServer = {
+			crypto: null,
+			createCommit,
+			describeCommit: () => ""
+		};
+		const fakeApp = { vault: { configDir: ".obsidian", adapter, getAbstractFileByPath: () => null } };
+		initConfig(fakeApp as never, fakeServer as never, "seafile");
+		const sync = new SyncController(adapter, { account: "person@example.com" } as never);
+		const remote: DirSeafDirent = { id: "root-id", mode: MODE_DIR, mtime: 1700000000, name: "" };
+		const root = await SyncNode.deserialize("", { prev: remote, children: {} });
+		root.setNext({ ...remote, mtime: remote.mtime + 1 }, false);
+
+		await expect(sync.push(root, [], "parent-commit")).resolves.toBe("parent-commit");
+		expect(createCommit).not.toHaveBeenCalled();
+		expect(root.next).toBeUndefined();
+		expect(warn).toHaveBeenCalledWith("Discarded stale pending state without semantic changes.");
+	});
+
+	test("does not publish metadata-only directory changes", async () => {
+		const warn = jest.spyOn(debug, "warn").mockImplementation(() => undefined);
+		const adapter = global.app.vault.adapter;
+		const createCommit = jest.fn(async () => { throw new Error("must not create a commit"); });
+		const fakeServer = { crypto: null, createCommit, describeCommit: () => "" };
+		const fakeApp = { vault: { configDir: ".obsidian", adapter, getAbstractFileByPath: () => null } };
+		initConfig(fakeApp as never, fakeServer as never, "seafile");
+		const sync = new SyncController(adapter, { account: "person@example.com" } as never);
+		const remote: DirSeafDirent = { id: "old-root", mode: MODE_DIR, mtime: 1700000000, name: "" };
+		const root = await SyncNode.deserialize("", { prev: remote, children: {} });
+		root.setNext({ ...remote, id: "metadata-only-root", mtime: remote.mtime + 1 }, false);
+
+		await expect(sync.push(root, [{ node: root, type: "modify" }], "parent-commit")).resolves.toBe("parent-commit");
+		expect(createCommit).not.toHaveBeenCalled();
+		expect(root.next).toBeUndefined();
+		expect(root.prevDirty).toBe(false);
+		expect(warn).toHaveBeenCalledWith(
+			"Discarded a metadata-only synchronization plan instead of publishing an empty commit."
+		);
 	});
 });

@@ -1,6 +1,5 @@
-import { describe, jest, test } from "@jest/globals";
+import { describe, test } from "@jest/globals";
 import Server, { Commit } from "../server";
-import * as utils from "../utils";
 import * as env from "./env";
 import { posix as Path } from "path-browserify";
 
@@ -23,13 +22,12 @@ describe("Server", () => {
 	});
 
 	test("Get fs", async () => {
-		const fs = await server.getFs(headCommit.root_id);
+		await server.getFs(headCommit.root_id);
 	});
 
-	let files = [];
 	test("List all", async () => {
 		const tree = await server.getDirInfo("/", true);
-		files = tree.map((file) => {
+		tree.map((file) => {
 			return {
 				path: Path.join(file.parent_dir, file.name),
 				mtime: file.mtime,

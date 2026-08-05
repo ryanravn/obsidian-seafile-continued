@@ -122,9 +122,9 @@ describe("sync progress planning", () => {
 			planSync: (path: string, node: SyncNode, remote: DirSeafDirent) => Promise<{ downloads: number, uploads: number }>
 		};
 
-		await expect(internal.planSync("", root, remoteRoot)).resolves.toEqual({ downloads: 1, uploads: 1 });
+		await expect(internal.planSync("", root, remoteRoot)).resolves.toMatchObject({ downloads: 1, uploads: 1 });
 		const callsAfterFirstPlan = { stats: stat.mock.calls.length, lists: list.mock.calls.length };
-		await expect(internal.planSync("", root, remoteRoot)).resolves.toEqual({ downloads: 1, uploads: 1 });
+		await expect(internal.planSync("", root, remoteRoot)).resolves.toMatchObject({ downloads: 1, uploads: 1 });
 		expect(stat).toHaveBeenCalledTimes(callsAfterFirstPlan.stats);
 		expect(list).toHaveBeenCalledTimes(callsAfterFirstPlan.lists);
 	});

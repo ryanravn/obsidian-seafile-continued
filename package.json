@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "lint": "eslint src --ext .ts --max-warnings 0",
     "test": "jest"
   },
   "keywords": [],

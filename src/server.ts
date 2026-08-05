@@ -430,6 +430,12 @@ export default class Server {
 		return await this.getRepoListWithToken(this.settings.authToken);
 	}
 
+	async getRepoPermission(repoId: string = this.settings.repoId): Promise<string> {
+		const repo = (await this.getRepoList()).find(item => item.repo_id === repoId);
+		if (!repo) throw new RepositoryUnavailableError(404);
+		return repo.permission;
+	}
+
 	async validateAuthToken(authToken: string): Promise<void> {
 		const token = authToken.trim();
 		if (!token) throw new Error("API token is required.");

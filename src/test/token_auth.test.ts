@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, jest, test } from "@jest/globals";
-import Server, { RepositoryUnavailableError } from "../server";
+import Server from "../server";
 import { DEFAULT_SETTINGS } from "../settings";
 
 function makeServer(): Server {
@@ -58,6 +58,19 @@ describe("manual API token authentication", () => {
 		await expect(client.getNotificationJwtToken("repo/id")).resolves.toBe("notification-jwt");
 		expect(fetchMock.mock.calls[0][0]).toBe("https://example.test/seafhttp/repo/repo%2Fid/jwt-token");
 		expect(fetchMock.mock.calls[0][1]?.headers).toEqual({ "Seafile-Repo-Token": "repository-token" });
+	});
+
+	test("reads the current repository permission", async () => {
+		jest.spyOn(global, "fetch").mockResolvedValue(new Response(
+			JSON.stringify({ repos: [{ repo_id: "repo", permission: "r" }] }),
+			{ status: 200, headers: { "Content-Type": "application/json" } }
+		));
+		const client = new Server(
+			{ ...DEFAULT_SETTINGS, host: "https://example.test", authToken: "token", repoId: "repo" },
+			{ manifest: { version: "test" } } as never
+		);
+
+		await expect(client.getRepoPermission()).resolves.toBe("r");
 	});
 
 	test("recognizes the notification server ping response", async () => {

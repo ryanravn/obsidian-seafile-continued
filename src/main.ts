@@ -1,12 +1,12 @@
 import { Notice, Plugin, TFile, normalizePath } from "obsidian";
-import { initConfig, PLUGIN_DIR } from "./config";
+import { ensurePluginGitignore, initConfig, PLUGIN_DIR } from "./config";
 import { SEAFILE_IGNORE_FILE } from "./ignore";
 import { RepoCrypto } from "./crypto";
 import { getPasswordStore } from "./password_store";
 import Server from "./server";
 import { SeafileNotificationClient } from "./notification";
 import { DEFAULT_SETTINGS, type SeafileSettings } from "./settings";
-import { SyncController } from "./sync/controller";
+import { SyncController, type MassDeletionWarning } from "./sync/controller";
 import { Explorer } from "./ui/explorer";
 import PasswordModal from "./ui/password_modal";
 import { SeafileSettingTab } from "./ui/setting_tab";
@@ -17,6 +17,10 @@ import type { DeletedEntry, FileRevision, LocalCheckpoint, SnapshotDiff } from "
 import { FileHistoryModal } from "./ui/file_history_modal";
 import { HISTORY_VIEW_TYPE, HistoryView } from "./ui/history_view";
 import { HttpError } from "./server";
+import Dialog from "./ui/dialog_modal";
+import { CredentialStore, withoutPersistedTokens } from "./credential_store";
+import { SyncIssueStore } from "./sync/issues";
+import { VaultVerificationModal } from "./ui/verification_modal";
 
 export default class SeafilePlugin extends Plugin {
 	settings: SeafileSettings;
@@ -26,13 +30,20 @@ export default class SeafilePlugin extends Plugin {
 	notifications: SeafileNotificationClient;
 	history: HistoryService;
 	checkpoints: LocalCheckpointStore;
+	private credentialStore: CredentialStore;
+	issues: SyncIssueStore;
 
 	async onload(): Promise<void> {
 		this.settings = await this.loadSettings();
 		this.server = new Server(this.settings, this);
 		initConfig(this.app, this.server, this.manifest.id);
+		await ensurePluginGitignore();
 
+		this.issues = new SyncIssueStore(this.app);
 		this.sync = new SyncController(this.app.vault.adapter, this.settings);
+		this.sync.onMassDeletionWarning = async warning => await this.confirmMassDeletion(warning);
+		this.sync.onRepositoryPermissionChanged = () => { void this.saveSettings(); };
+		this.sync.onIssue = issue => { this.issues.add(issue); };
 		this.history = new HistoryService(this.server);
 		this.checkpoints = new LocalCheckpointStore(
 			this.app, this.app.vault.adapter, this.settings, this.manifest.id,
@@ -101,6 +112,11 @@ export default class SeafilePlugin extends Plugin {
 			name: "Open vault snapshots",
 			callback: () => { void this.openHistoryView("snapshots"); },
 		});
+		this.addCommand({
+			id: "open-sync-issues",
+			name: "Open sync issues",
+			callback: () => { void this.openHistoryView("issues"); },
+		});
 
 		if (this.settings.devMode) {
 			(window as unknown as Record<string, unknown>)["seafile"] = this; // for debug
@@ -149,7 +165,7 @@ export default class SeafilePlugin extends Plugin {
 		new FileHistoryModal(this.app, this, path, revision).open();
 	}
 
-	async openHistoryView(tab: "activity" | "file" | "snapshots" | "deleted" = "activity", filePath = ""): Promise<void> {
+	async openHistoryView(tab: "activity" | "file" | "snapshots" | "deleted" | "issues" = "activity", filePath = ""): Promise<void> {
 		let leaf = this.app.workspace.getLeavesOfType(HISTORY_VIEW_TYPE)[0];
 		if (!leaf) {
 			leaf = this.app.workspace.getRightLeaf(false) ?? this.app.workspace.getLeaf(true);
@@ -324,6 +340,23 @@ export default class SeafilePlugin extends Plugin {
 		await this.sync.resetForRepositoryChange();
 	}
 
+	async verifyVault(): Promise<void> {
+		const notice = new Notice("Verifying Seafile vault…", 0);
+		try {
+			const report = await this.sync.verifyVault();
+			new VaultVerificationModal(this.app, report).open();
+		} finally {
+			notice.hide();
+		}
+	}
+
+	async rebuildSyncIndex(): Promise<void> {
+		this.notifications.stop();
+		await this.sync.rebuildSyncIndex();
+		this.issues.add({ kind: "recovery", message: "Rebuilt the local sync index without deleting vault files." });
+		if (this.settings.enableSync) await this.enableSync();
+	}
+
 	private async whenLayoutReady(): Promise<void> {
 		await new Promise<void>((resolve) => {
 			this.app.workspace.onLayoutReady(() => { resolve(); });
@@ -352,6 +385,24 @@ export default class SeafilePlugin extends Plugin {
 		this.sync.startSync();
 		this.refreshNotifications();
 		new Notice("Sync started");
+	}
+
+	private async confirmMassDeletion(warning: MassDeletionWarning): Promise<boolean> {
+		const location = warning.direction === "local" ? "this device" : "the remote Seafile library";
+		return await new Promise<boolean>(resolve => {
+			let settled = false;
+			const finish = (value: boolean): void => {
+				if (settled) return;
+				settled = true;
+				resolve(value);
+			};
+			new Dialog(this.app,
+				"Confirm mass deletion",
+				`This sync would delete ${warning.deletions.toLocaleString()} files from ${location} (${warning.percentage.toFixed(1)}% of the ${warning.trackedFiles.toLocaleString()} previously synchronized files).\n\nContinue only if this deletion is expected.`,
+				() => { finish(true); },
+				() => { finish(false); }
+			).open();
+		});
 	}
 
 	checkSyncReady(): boolean {
@@ -454,7 +505,7 @@ export default class SeafilePlugin extends Plugin {
 			const list = await this.app.vault.adapter.list(PLUGIN_DIR);
 			for (const path of list.files) {
 				const basename = path.split("/").pop();
-				if (basename === "main.js" || basename === "manifest.json" || basename === "styles.css" || basename === "data.json") continue;
+				if (basename === "main.js" || basename === "manifest.json" || basename === "styles.css" || basename === "data.json" || basename === ".gitignore") continue;
 				await this.app.vault.adapter.remove(path);
 			}
 			for (const path of list.folders) {
@@ -477,6 +528,8 @@ export default class SeafilePlugin extends Plugin {
 	async loadSettings(): Promise<SeafileSettings> {
 		const data = await this.loadData() as Partial<SeafileSettings> | null;
 		const settings: SeafileSettings = Object.assign({}, DEFAULT_SETTINGS, data);
+		this.credentialStore = new CredentialStore(this.app);
+		const migratedCredentials = this.credentialStore.hydrate(settings);
 		if (!["always", "syncing", "never"].includes(settings.syncStatusTextMode)) {
 			settings.syncStatusTextMode = DEFAULT_SETTINGS.syncStatusTextMode;
 		}
@@ -486,11 +539,18 @@ export default class SeafilePlugin extends Plugin {
 		if (!Number.isFinite(settings.localHistoryIntervalMinutes) || settings.localHistoryIntervalMinutes < 1) settings.localHistoryIntervalMinutes = 5;
 		if (!Number.isFinite(settings.localHistoryRetentionDays) || settings.localHistoryRetentionDays < 1) settings.localHistoryRetentionDays = 7;
 		if (!Number.isFinite(settings.localHistoryMaxBytes) || settings.localHistoryMaxBytes < 1024 * 1024) settings.localHistoryMaxBytes = 250 * 1024 * 1024;
+		if (!Number.isFinite(settings.deletionProtectionFileThreshold) || settings.deletionProtectionFileThreshold < 1) settings.deletionProtectionFileThreshold = 500;
+		if (!Number.isFinite(settings.deletionProtectionPercentThreshold) || settings.deletionProtectionPercentThreshold <= 0 || settings.deletionProtectionPercentThreshold > 100) settings.deletionProtectionPercentThreshold = 25;
+		if (!Number.isFinite(settings.deletionProtectionPercentMinimumFiles) || settings.deletionProtectionPercentMinimumFiles < 1) settings.deletionProtectionPercentMinimumFiles = 20;
+		if (migratedCredentials || settings.authToken || settings.repoToken) {
+			await this.saveData(withoutPersistedTokens(settings));
+		}
 		return settings;
 	}
 
 	async saveSettings(settings: SeafileSettings = this.settings): Promise<void> {
 		this.settings = settings;
-		await this.saveData(settings);
+		this.credentialStore.persist(settings);
+		await this.saveData(withoutPersistedTokens(settings));
 	}
 }

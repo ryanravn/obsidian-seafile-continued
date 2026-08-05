@@ -1,5 +1,5 @@
-import { describe, expect, jest, test } from "@jest/globals";
-import Server, { Commit, DirInfo } from "../server";
+import { describe, expect, test } from "@jest/globals";
+import Server, { DirInfo } from "../server";
 import fs from "fs";
 import * as env from "./env";
 import { NodeChange, SyncController } from "../sync/controller";
@@ -33,13 +33,6 @@ describe("Basic test", () => {
 			expect(rootNode.prevDirty).toBeFalsy();
 			expect(rootNode.state.type).toBe("sync");
 		}
-	};
-
-	const findRandomFile = (): string => {
-		const files = dirInfo.filter(info => info.type == "file");
-		const index = Math.floor(Math.random() * files.length);
-		const file = files[index];
-		return Path.join(file.parent_dir, file.name);
 	};
 
 	const findRandomFolder = (): string => {

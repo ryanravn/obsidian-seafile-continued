@@ -23,6 +23,11 @@ export interface SeafileSettings {
 	localHistoryRetentionDays: number
 	localHistoryMaxBytes: number
 	lastSnapshotUndoCommit: string
+	deletionProtectionEnabled: boolean
+	deletionProtectionFileThreshold: number
+	deletionProtectionPercentThreshold: number
+	deletionProtectionPercentMinimumFiles: number
+	repoPermission: string
 
   // Encryption metadata (public, server-supplied). Password is never persisted.
   encrypted: boolean
@@ -54,6 +59,11 @@ export const DEFAULT_SETTINGS: SeafileSettings = {
 	localHistoryRetentionDays: 7,
 	localHistoryMaxBytes: 250 * 1024 * 1024,
 	lastSnapshotUndoCommit: "",
+	deletionProtectionEnabled: true,
+	deletionProtectionFileThreshold: 500,
+	deletionProtectionPercentThreshold: 25,
+	deletionProtectionPercentMinimumFiles: 20,
+	repoPermission: "",
 	encrypted: false,
 	encVersion: 0,
 	repoSalt: "",

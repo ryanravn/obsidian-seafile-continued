@@ -7,7 +7,7 @@ import { FileHistoryPanel } from "./file_history_panel";
 import styles from "./history.module.css";
 
 export const HISTORY_VIEW_TYPE = "seafile-sync-history";
-type HistoryTab = "activity" | "file" | "snapshots" | "deleted";
+type HistoryTab = "activity" | "file" | "snapshots" | "deleted" | "issues";
 
 export class HistoryView extends ItemView {
 	private tab: HistoryTab = "activity";
@@ -58,7 +58,7 @@ export class HistoryView extends ItemView {
 		container.empty();
 		container.createEl("h2", { text: "Seafile history" });
 		const toolbar = container.createDiv({ cls: styles.toolbar });
-		for (const [tab, label] of [["activity", "Activity"], ["file", "File versions"], ["snapshots", "Vault snapshots"], ["deleted", "Deleted files"]] as const) {
+		for (const [tab, label] of [["activity", "Activity"], ["file", "File versions"], ["snapshots", "Vault snapshots"], ["deleted", "Deleted files"], ["issues", "Sync issues"]] as const) {
 			const button = toolbar.createEl("button", { text: label });
 			if (tab === this.tab) button.addClass("mod-cta");
 			button.addEventListener("click", () => { void this.showTab(tab); });
@@ -67,7 +67,8 @@ export class HistoryView extends ItemView {
 			if (this.tab === "activity") await this.renderActivity(container);
 			else if (this.tab === "file") await this.renderFileHistory(container);
 			else if (this.tab === "snapshots") await this.renderSnapshots(container);
-			else await this.renderDeleted(container);
+			else if (this.tab === "deleted") await this.renderDeleted(container);
+			else this.renderIssues(container);
 		} catch (error) {
 			container.createEl("p", { text: `History could not be loaded: ${(error as Error).message}`, cls: styles.danger });
 			new Setting(container).addButton(button => button.setButtonText("Retry").onClick(() => { void this.render(); }));
@@ -258,5 +259,40 @@ export class HistoryView extends ItemView {
 
 	private deletedPath(entry: DeletedEntry): string {
 		return `${entry.parentDir.replace(/\/$/, "")}/${entry.name}` || `/${entry.name}`;
+	}
+
+	private renderIssues(container: HTMLElement): void {
+		const issues = this.plugin.issues.list();
+		const openCount = issues.filter(issue => !issue.resolved).length;
+		new Setting(container)
+			.setName(`${openCount} open sync issue${openCount === 1 ? "" : "s"}`)
+			.setDesc("Conflicts, safety stops, recovery actions, and repeated errors are retained on this device.")
+			.addButton(button => button.setButtonText("Clear resolved").onClick(() => {
+				this.plugin.issues.clearResolved();
+				void this.render();
+			}));
+		if (issues.length === 0) {
+			container.createEl("p", { text: "No sync issues have been recorded.", cls: styles.meta });
+			return;
+		}
+		for (const issue of issues) {
+			const row = container.createDiv({ cls: styles.activity });
+			row.createEl("strong", { text: `${issue.resolved ? "Resolved" : "Open"} · ${issue.kind}` });
+			row.createDiv({ text: issue.message });
+			row.createDiv({
+				text: `${new Date(issue.lastSeenAt).toLocaleString()}${issue.occurrences > 1 ? ` · occurred ${issue.occurrences} times` : ""}`,
+				cls: styles.meta
+			});
+			for (const path of [issue.path, issue.relatedPath].filter((value): value is string => !!value)) {
+				const pathButton = row.createEl("button", { text: path });
+				pathButton.addEventListener("click", () => { void this.app.workspace.openLinkText(path, "", false); });
+			}
+			new Setting(row).addButton(button => button
+				.setButtonText(issue.resolved ? "Reopen" : "Mark resolved")
+				.onClick(() => {
+					this.plugin.issues.resolve(issue.id, !issue.resolved);
+					void this.render();
+				}));
+		}
 	}
 }

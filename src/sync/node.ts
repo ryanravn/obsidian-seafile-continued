@@ -316,6 +316,24 @@ export class SyncNode {
 		this.nextDirty = dirty;
 	}
 
+	/** Discard computed upload state so the next cycle recomputes it from disk. */
+	clearPendingTree() {
+		this.next = undefined;
+		this.nextDirty = true;
+		if (this.state.type === "upload" || this.state.type === "download") {
+			this.state = { type: "init" };
+		}
+		for (const child of Object.values(this.children)) child.clearPendingTree();
+	}
+
+	/** Accept the existing remote baseline after dropping a metadata-only upload. */
+	discardPendingAsSynchronized() {
+		this.next = undefined;
+		this.nextDirty = true;
+		this.prevDirty = false;
+		this.state = this.prev ? { type: "sync" } : { type: "init" };
+	}
+
 	get prev(): SeafDirent | undefined {
 		return this._prev;
 	}
@@ -348,6 +366,7 @@ export class SyncNode {
 	}
 
 	async delete() {
+		this.setNext(undefined, true);
 		if (this.parent) {
 			this.parent.removeChild(this);
 		}

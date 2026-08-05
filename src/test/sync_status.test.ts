@@ -44,6 +44,8 @@ describe("sync status", () => {
 			ignore: "",
 			interval: 1000,
 		} as never);
+		const onIssue = jest.fn();
+		sync.onIssue = onIssue;
 		jest.spyOn(sync, "sync").mockRejectedValue(new Error("server rejected the request"));
 
 		(sync as unknown as { status: { type: "idle" } }).status = { type: "idle" };
@@ -53,7 +55,37 @@ describe("sync status", () => {
 			type: "idle",
 			error: "server rejected the request",
 		});
+		expect(onIssue).not.toHaveBeenCalled();
 		await sync.stopSyncAsync();
+	});
+
+	test("records a generic failure only after automatic retries are exhausted", async () => {
+		jest.useFakeTimers();
+		const sync = new SyncController({} as never, { ignore: "", interval: 1000 } as never);
+		const onIssue = jest.fn();
+		sync.onIssue = onIssue;
+		jest.spyOn(sync, "sync").mockRejectedValue(new Error("persistent server failure"));
+		(sync as unknown as { status: { type: "idle" } }).status = { type: "idle" };
+
+		for (let attempt = 0; attempt < 5; attempt++) await sync.syncCycle();
+
+		expect(sync.status).toMatchObject({ type: "stop", message: "error" });
+		expect(onIssue).toHaveBeenCalledTimes(1);
+		expect(onIssue).toHaveBeenCalledWith({ kind: "error", message: "persistent server failure" });
+	});
+
+	test("does not record a HEAD race even if retries are exhausted", async () => {
+		jest.useFakeTimers();
+		const sync = new SyncController({} as never, { ignore: "", interval: 1000 } as never);
+		const onIssue = jest.fn();
+		sync.onIssue = onIssue;
+		jest.spyOn(sync, "sync").mockRejectedValue(new Error("Seafile HEAD verification failed: expected 'ours', received 'theirs'."));
+		(sync as unknown as { status: { type: "idle" } }).status = { type: "idle" };
+
+		for (let attempt = 0; attempt < 5; attempt++) await sync.syncCycle();
+
+		expect(sync.status).toMatchObject({ type: "stop", message: "error" });
+		expect(onIssue).not.toHaveBeenCalled();
 	});
 
 	test("clears an earlier failure after a successful retry", async () => {

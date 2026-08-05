@@ -8,6 +8,8 @@ import { debug } from "../utils";
 import { compileIgnoreList, SEAFILE_IGNORE_FILE, type IgnoreList } from "../ignore";
 import { SyncNode, type STATE_UPLOAD, type SyncStateChangedListener as NodeStateChangedListener } from "./node";
 import { MobileDataAdapter } from "src/@types/obsidian";
+import { findCaseCollisions, validatePathSegment, type PathPreflightIssue } from "./preflight";
+import { shouldSurfaceSyncIssue, type SyncIssueInput } from "./issues";
 
 export interface NodeChange {
   node: SyncNode
@@ -40,9 +42,63 @@ export type SyncProgress = {
   totalItems: number
 }
 
-interface SyncPlan {
+export interface SyncPlan {
   downloads: number
   uploads: number
+	localDeletions: number
+	remoteDeletions: number
+	requiresRemoteWrite: boolean
+	pathIssues: PathPreflightIssue[]
+}
+
+export interface MassDeletionWarning {
+	direction: "local" | "remote"
+	deletions: number
+	trackedFiles: number
+	percentage: number
+}
+
+export interface VaultVerificationReport {
+	remoteHead: string
+	knownLocalHead: string
+	repositoryPermission: string
+	trackedFiles: number
+	downloads: number
+	uploads: number
+	localDeletions: number
+	remoteDeletions: number
+	pathIssues: PathPreflightIssue[]
+	indexHealthy: boolean
+}
+
+export class SyncSafetyInterlockError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "SyncSafetyInterlockError";
+	}
+}
+
+export class SyncPreflightError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "SyncPreflightError";
+	}
+}
+
+export function massDeletionWarning(
+	settings: Pick<SeafileSettings, "deletionProtectionEnabled" | "deletionProtectionFileThreshold" | "deletionProtectionPercentThreshold" | "deletionProtectionPercentMinimumFiles">,
+	direction: "local" | "remote",
+	deletions: number,
+	trackedFiles: number
+): MassDeletionWarning | null {
+	if (!settings.deletionProtectionEnabled || deletions <= 0) return null;
+	const percentage = trackedFiles > 0 ? deletions / trackedFiles * 100 : 0;
+	const exceedsFileThreshold = deletions >= settings.deletionProtectionFileThreshold;
+	const exceedsPercentageThreshold = deletions >= settings.deletionProtectionPercentMinimumFiles
+		&& percentage >= settings.deletionProtectionPercentThreshold;
+	return exceedsFileThreshold || exceedsPercentageThreshold
+		? { direction, deletions, trackedFiles, percentage }
+		: null;
 }
 
 type SyncTarget = "same" | "local" | "remote" | "merge" | "conflict"
@@ -145,7 +201,7 @@ class UploadSlotPool {
 
 export interface SYNC_STOP {
   type: "stop"
-  message?: "error" | "user" | "repository-unavailable"
+  message?: "error" | "user" | "repository-unavailable" | "safety" | "preflight"
   error?: string
 }
 
@@ -175,6 +231,7 @@ export class SyncController {
 	private preparedBlockBytes = 0;
 	private preparedBlockCacheEnabled = false;
 	private syncMetrics: SyncMetrics | null = null;
+	private pendingStateMayBeStale = false;
 
 	private ignore: IgnoreList = compileIgnoreList("");
 	private ignoreFileBootstrapped = false;
@@ -186,6 +243,10 @@ export class SyncController {
 	public constructor (
     private readonly adapter: DataAdapter,
 	private readonly settings: SeafileSettings) {}
+
+	public onMassDeletionWarning: ((warning: MassDeletionWarning) => Promise<boolean>) | null = null;
+	public onRepositoryPermissionChanged: ((permission: string) => void) | null = null;
+	public onIssue: ((issue: SyncIssueInput) => void) | null = null;
 
 	private normalizePath(path: string): string {
 		while (path.startsWith("/")) path = path.slice(1);
@@ -488,6 +549,7 @@ export class SyncController {
 		this.ignoreFileBootstrapped = false;
 		this.consecutiveFailures = 0;
 		this.syncRequested = false;
+		this.pendingStateMayBeStale = false;
 		this.clearLocalSnapshot();
 		this.clearPreparedBlocks();
 		await this.init();
@@ -511,6 +573,7 @@ export class SyncController {
 			}
 		}
 		await this.adapter.write(DOWNLOAD_JOURNAL_PATH, "");
+		this.onIssue?.({ kind: "recovery", message: "Recovered a file after an interrupted download.", path: this.normalizePath(journal.path) });
 	}
 
 	private async unusedSiblingPath(path: string, marker: string): Promise<string> {
@@ -547,6 +610,12 @@ export class SyncController {
 
 		const conflictNode = node.parent.createChild(Path.basename(conflictPath));
 		await this.pull(changes, conflictPath, conflictNode, undefined);
+		this.onIssue?.({
+			kind: "conflict",
+			message: "Both the local and remote file changed. The local version was preserved as a conflict copy.",
+			path: this.normalizePath(path),
+			relatedPath: this.normalizePath(conflictPath)
+		});
 	}
 
 	async downloadFile (path: string, fsId: string, mtime: number, expectedSize: number, onProgress?: (completedBytes: number) => void) {
@@ -688,8 +757,33 @@ export class SyncController {
 		return counts.reduce((total, count) => total + count, 0);
 	}
 
+	private emptyPlan(): SyncPlan {
+		return { downloads: 0, uploads: 0, localDeletions: 0, remoteDeletions: 0, requiresRemoteWrite: false, pathIssues: [] };
+	}
+
+	private mergePlan(target: SyncPlan, source: SyncPlan): void {
+		target.downloads += source.downloads;
+		target.uploads += source.uploads;
+		target.localDeletions += source.localDeletions;
+		target.remoteDeletions += source.remoteDeletions;
+		target.requiresRemoteWrite ||= source.requiresRemoteWrite;
+		target.pathIssues.push(...source.pathIssues);
+	}
+
+	private async countRemoteFiles(remote: SeafDirent): Promise<number> {
+		if (remote.mode === MODE_FILE) return 1;
+		const fs = await this.getDirectoryFs(remote.id);
+		const counts = await Promise.all((fs?.dirents ?? []).map(async child => await this.countRemoteFiles(child)));
+		return counts.reduce((sum, count) => sum + count, 0);
+	}
+
+	private countTrackedFiles(node: SyncNode = this.nodeRoot): number {
+		if (node.prev?.mode === MODE_FILE) return 1;
+		return Object.values(node.getChildren()).reduce((sum, child) => sum + this.countTrackedFiles(child), 0);
+	}
+
 	private async planSync(path: string, node: SyncNode | undefined, remote?: SeafDirent): Promise<SyncPlan> {
-		const plan: SyncPlan = { downloads: 0, uploads: 0 };
+		const plan = this.emptyPlan();
 		if (this.isInternalPath(path)) return plan;
 
 		const local = await this.getLocalStat(path);
@@ -697,6 +791,10 @@ export class SyncController {
 		const ignored = this.ignore.denies(path, isDirectory);
 		if (ignored && !remote && !node?.prev) return plan;
 		if (ignored && node?.prev && remote && node.prev.id === remote.id) return plan;
+		if (path) {
+			const pathIssue = validatePathSegment(path);
+			if (pathIssue) plan.pathIssues.push(pathIssue);
+		}
 
 		let target = this.determineTarget(local, remote, node);
 		if (target === "same") return plan;
@@ -708,8 +806,16 @@ export class SyncController {
 				// while the remote side is downloaded at the original path.
 				if (local?.type === "file") plan.uploads++;
 				else if (local?.type === "folder") plan.uploads += await this.countLocalUploadFiles(path);
+				plan.requiresRemoteWrite = true;
 				target = "remote";
 			}
+		}
+		if (target === "remote" && !remote && local) {
+			plan.localDeletions += local.type === "file" ? 1 : await this.countLocalUploadFiles(path);
+		}
+		if (target === "local") {
+			plan.requiresRemoteWrite = true;
+			if (!local && remote) plan.remoteDeletions += await this.countRemoteFiles(remote);
 		}
 
 		const names = new Set<string>();
@@ -730,15 +836,13 @@ export class SyncController {
 		const nodeChildren = node?.getChildren() ?? {};
 		if (recurse) for (const name of Object.keys(nodeChildren)) names.add(name);
 		if (recurse) {
+			plan.pathIssues.push(...findCaseCollisions(path, names));
 			const children = await Promise.all(Array.from(names, async name => {
 				const childNode = nodeChildren[name];
 				const remoteChild = target === "local" ? childNode?.prev : remoteChildren[name];
 				return await this.planSync(`${path}/${name}`, childNode, remoteChild);
 			}));
-			for (const child of children) {
-				plan.downloads += child.downloads;
-				plan.uploads += child.uploads;
-			}
+			for (const child of children) this.mergePlan(plan, child);
 		}
 
 		if (target === "remote" && remote?.mode === MODE_FILE) plan.downloads++;
@@ -746,10 +850,32 @@ export class SyncController {
 		return plan;
 	}
 
+	private async enforcePlanSafety(plan: SyncPlan, repoPermission: string): Promise<void> {
+		if (plan.pathIssues.length > 0) {
+			const first = plan.pathIssues[0];
+			throw new SyncPreflightError(`Cannot synchronize '${first.path}': ${first.detail}. Fix this path before syncing.`);
+		}
+		if (plan.requiresRemoteWrite && repoPermission !== "rw") {
+			throw new SyncPreflightError(`The selected library is read-only (${repoPermission}). Local changes were not uploaded.`);
+		}
+		const trackedFiles = this.countTrackedFiles();
+		for (const warning of [
+			massDeletionWarning(this.settings, "local", plan.localDeletions, trackedFiles),
+			massDeletionWarning(this.settings, "remote", plan.remoteDeletions, trackedFiles)
+		]) {
+			if (!warning) continue;
+			const approved = await this.onMassDeletionWarning?.(warning) ?? false;
+			if (!approved) {
+				throw new SyncSafetyInterlockError(`Blocked deletion of ${warning.deletions} ${warning.direction} files pending user confirmation.`);
+			}
+		}
+	}
+
 	public async pull (changes: NodeChange[], path: string, node: SyncNode, remote?: SeafDirent) {
 		// Operational plugin state is never part of the library, even if a
 		// malformed or remotely edited ignore file omits the recommended rule.
 		if (this.isInternalPath(path)) {
+			node.clearPendingTree();
 			if (remote) {
 				await node.setPrevAsync(remote, false);
 				node.state = { type: "sync" };
@@ -773,6 +899,7 @@ export class SyncController {
 			return;
 		}
 		if (ignored && node.prev && remote && node.prev.id === remote.id) {
+			node.clearPendingTree();
 			await node.setPrevAsync(remote, false);
 			node.state = { type: "sync" };
 			return;
@@ -780,6 +907,7 @@ export class SyncController {
 
 		let target = this.determineTarget(local, remote, node);
 		if (target === "same") {
+			node.clearPendingTree();
 			if (local || remote) {
 				await node.setPrevAsync(remote, false);
 				node.state = { type: "sync" };
@@ -1345,30 +1473,18 @@ export class SyncController {
 			debug.log("Nothing to push");
 			return parentCommitId;
 		}
+		if (changes.length === 0) {
+			nodeRoot.clearPendingTree();
+			debug.warn("Discarded stale pending state without semantic changes.");
+			return parentCommitId;
+		}
+		if (nodeRoot.prev?.id === nodeRoot.next.id) {
+			nodeRoot.clearPendingTree();
+			debug.warn("Discarded a pending commit whose root filesystem is unchanged.");
+			return parentCommitId;
+		}
 
 		const uploads = changes.filter(change => change.type == "add" || change.type == "modify").map(change => change.node);
-		const fileUploads: FileUpload[] = [];
-		for (const node of uploads) {
-			if (node.state.type !== "upload" || !node.next) throw Error("Node is not in upload state or has no next");
-			if (!node.state.param.source) continue;
-			const fs = node.state.param.fs;
-			if (fs && (fs.type !== TYPE_FILE || !("block_ids" in fs))) {
-				throw new Error(`File '${node.state.param.source.path}' has invalid filesystem metadata.`);
-			}
-			fileUploads.push({ node, state: node.state, blockIds: fs && "block_ids" in fs ? fs.block_ids : [] });
-		}
-		if (this.progressCounts) {
-			this.progressCounts.plan.uploads = fileUploads.length;
-			this.progressCounts.uploads = 0;
-			if (fileUploads.length > 0) this.reportProgress({ operation: "upload", completedFiles: 0, totalFiles: fileUploads.length });
-		}
-		await this.uploadFileObjects(fileUploads);
-		if (this.status.type === "busy") this.status.progress = undefined;
-		await this.measurePhase("publish filesystem objects", async () => {
-			await this.uploadFilesystemObjects(uploads, progress => { this.reportProgress(progress); });
-		});
-
-		// Create commit
 		const addedFiles = changes.filter(c => c.type == "add" && c.node.next!.mode == MODE_FILE);
 		const removedFiles = changes.filter(c => c.type == "remove-file");
 		const addedDirectories = changes.filter(c => c.type == "add" && c.node.next!.mode == MODE_DIR);
@@ -1393,6 +1509,34 @@ export class SyncController {
 			renamedFiles,
 			renamedDirectories
 		});
+		if (!description) {
+			for (const node of uploads) node.discardPendingAsSynchronized();
+			debug.warn("Discarded a metadata-only synchronization plan instead of publishing an empty commit.");
+			return parentCommitId;
+		}
+
+		const fileUploads: FileUpload[] = [];
+		for (const node of uploads) {
+			if (node.state.type !== "upload" || !node.next) throw Error("Node is not in upload state or has no next");
+			if (!node.state.param.source) continue;
+			const fs = node.state.param.fs;
+			if (fs && (fs.type !== TYPE_FILE || !("block_ids" in fs))) {
+				throw new Error(`File '${node.state.param.source.path}' has invalid filesystem metadata.`);
+			}
+			fileUploads.push({ node, state: node.state, blockIds: fs && "block_ids" in fs ? fs.block_ids : [] });
+		}
+		if (this.progressCounts) {
+			this.progressCounts.plan.uploads = fileUploads.length;
+			this.progressCounts.uploads = 0;
+			if (fileUploads.length > 0) this.reportProgress({ operation: "upload", completedFiles: 0, totalFiles: fileUploads.length });
+		}
+		await this.uploadFileObjects(fileUploads);
+		if (this.status.type === "busy") this.status.progress = undefined;
+		await this.measurePhase("publish filesystem objects", async () => {
+			await this.uploadFilesystemObjects(uploads, progress => { this.reportProgress(progress); });
+		});
+
+		// Create commit
 		this.reportProgress({ operation: "publish-commit", completedItems: 0, totalItems: 1 });
 		const commit = await this.measurePhase("publish commit", async () => {
 			const nextCommit = await server.createCommit(nodeRoot.next!.id, description, parentCommitId);
@@ -1423,6 +1567,7 @@ export class SyncController {
 	private readonly ignoreChange = new Set<string>();
 	async notifyChange (path: string, type: "create" | "modify" | "delete") {
 		if (this.ignoreChange.has(path)) return;
+		if (this.isInternalPath(path)) return;
 		if (this.normalizePath(path) === SEAFILE_IGNORE_FILE) {
 			const contents = type === "delete" ? "" : await this.adapter.read(SEAFILE_IGNORE_FILE);
 			this.ignore = compileIgnoreList(contents);
@@ -1455,6 +1600,10 @@ export class SyncController {
 
 	async sync () {
 		if (this.localHead === undefined) throw new Error("Sync controller is not initialized.");
+		// Pending filesystem objects are derived state. A failed or interrupted
+		// attempt must never carry them into a later reconciliation, where an
+		// otherwise identical remote tree could turn them into an empty commit.
+		if (this.pendingStateMayBeStale) this.nodeRoot.clearPendingTree();
 		this.progressCounts = null;
 		this.directoryFsCache.clear();
 		this.clearLocalSnapshot();
@@ -1465,16 +1614,21 @@ export class SyncController {
 		this.status = { type: "busy", message: "fetch" };
 		const changes: NodeChange[] = [];
 		try {
-			const [remoteHead, remoteRoot] = await this.measurePhase("fetch remote metadata", async () => {
-				const head = await server.getHeadCommitId();
+			const [remoteHead, remoteRoot, repoPermission] = await this.measurePhase("fetch remote metadata", async () => {
+				const [head, permission] = await Promise.all([server.getHeadCommitId(), server.getRepoPermission()]);
 				const root = await server.getCommitRoot(head);
 				await this.bootstrapIgnoreFile(root);
-				return [head, root] as const;
+				return [head, root, permission] as const;
 			});
+			if (repoPermission !== this.settings.repoPermission) {
+				this.settings.repoPermission = repoPermission;
+				this.onRepositoryPermissionChanged?.(repoPermission);
+			}
 
 			this.status.progress = undefined;
 			this.status.message = "download";
 			const plan = await this.measurePhase("plan changes", async () => await this.planSync("", this.nodeRoot, remoteRoot));
+			await this.enforcePlanSafety(plan, repoPermission);
 			this.progressCounts = { downloads: 0, uploadsPrepared: 0, uploads: 0, plan };
 			if (plan.downloads > 0) {
 				this.reportProgress({ operation: "download", completedFiles: 0, totalFiles: plan.downloads });
@@ -1483,6 +1637,7 @@ export class SyncController {
 			}
 			this.preparedBlockCacheEnabled = Platform.isDesktop;
 
+			this.pendingStateMayBeStale = true;
 			await this.measurePhase("reconcile files", async () => {
 				await this.pull(changes, "", this.nodeRoot, remoteRoot);
 			});
@@ -1492,6 +1647,7 @@ export class SyncController {
 			this.status.message = "upload";
 			const newHead = await this.measurePhase("push changes", async () => await this.push(this.nodeRoot, changes, this.localHead!));
 			await this.setLocalHeadAsync(newHead);
+			this.pendingStateMayBeStale = false;
 
 			if (SyncNode.dataLogCount > 100) {
 				this.reportProgress({ operation: "compact-state", completedItems: 0, totalItems: 1 });
@@ -1549,6 +1705,38 @@ export class SyncController {
 
 	public isLocallySynchronized(): boolean {
 		return this.status.type === "idle" && this.nodeRoot?.state.type === "sync";
+	}
+
+	public async verifyVault(): Promise<VaultVerificationReport> {
+		if (this.status.type === "busy") throw new Error("Wait for the current synchronization to finish before verifying the vault.");
+		if (!this.nodeRoot || this.localHead === undefined) throw new Error("Sync controller is not initialized.");
+		this.directoryFsCache.clear();
+		this.clearLocalSnapshot();
+		try {
+			const [remoteHead, permission] = await Promise.all([server.getHeadCommitId(), server.getRepoPermission()]);
+			const remoteRoot = await server.getCommitRoot(remoteHead);
+			await this.bootstrapIgnoreFile(remoteRoot);
+			const plan = await this.planSync("", this.nodeRoot, remoteRoot);
+			return {
+				remoteHead,
+				knownLocalHead: this.localHead,
+				repositoryPermission: permission,
+				trackedFiles: this.countTrackedFiles(),
+				downloads: plan.downloads,
+				uploads: plan.uploads,
+				localDeletions: plan.localDeletions,
+				remoteDeletions: plan.remoteDeletions,
+				pathIssues: plan.pathIssues,
+				indexHealthy: !!this.nodeRoot.prev && !!this.localHead
+			};
+		} finally {
+			this.directoryFsCache.clear();
+			this.clearLocalSnapshot();
+		}
+	}
+
+	public async rebuildSyncIndex(): Promise<void> {
+		await this.resetForRepositoryChange();
 	}
 
 	public async waitUntilIdle(timeoutMs = 5 * 60 * 1000): Promise<void> {
@@ -1610,17 +1798,32 @@ export class SyncController {
 				failed = true;
 				failureMessage = e instanceof Error ? e.message : String(e);
 				debug.error(e);
+				const issue: SyncIssueInput = {
+					kind: e instanceof SyncSafetyInterlockError ? "safety" : e instanceof SyncPreflightError ? "preflight" : "error",
+					message: failureMessage ?? "Unknown sync error"
+				};
+				const reportImmediately = e instanceof RepositoryUnavailableError
+					|| e instanceof SyncSafetyInterlockError
+					|| e instanceof SyncPreflightError;
+				if (reportImmediately && shouldSurfaceSyncIssue(issue)) this.onIssue?.(issue);
 
 				if (e instanceof RepositoryUnavailableError) {
 					this.status = { type: "stop", message: "repository-unavailable", error: e.message };
 					this.onRepositoryUnavailable?.();
 					new Notice(`${e.message} Local files were preserved. Choose another repository or restore access before resuming sync.`, 0);
+				} else if (e instanceof SyncSafetyInterlockError) {
+					this.status = { type: "stop", message: "safety", error: e.message };
+					new Notice(e.message, 0);
+				} else if (e instanceof SyncPreflightError) {
+					this.status = { type: "stop", message: "preflight", error: e.message };
+					new Notice(e.message, 0);
 				} else {
 					this.consecutiveFailures++;
 				}
 
 				if (this.status.type === "busy" && this.consecutiveFailures >= SyncController.MAX_CONSECUTIVE_FAILURES) {
 					this.status = { type: "stop", message: "error" };
+					if (!reportImmediately && shouldSurfaceSyncIssue(issue)) this.onIssue?.(issue);
 					new Notice(`Sync failed after ${this.consecutiveFailures} attempts: ${(e as Error).message}`);
 				} else if (this.status.type === "busy") {
 					debug.warn(`Sync attempt ${this.consecutiveFailures} failed, retrying: ${(e as Error).message}`);

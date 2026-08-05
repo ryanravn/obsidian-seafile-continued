@@ -144,7 +144,9 @@ export class SeafileSettingTab extends PluginSettingTab {
 				name: "Repository",
 				desc: repositoryUnavailable
 					? `${settings.repoName || "Configured repository"} is unavailable. Choose a replacement without deleting local files.`
-					: settings.repoName || "Choose a repository to sync.",
+					: settings.repoName
+						? `${settings.repoName}${settings.repoPermission && settings.repoPermission !== "rw" ? ` (read only: ${settings.repoPermission})` : ""}`
+						: "Choose a repository to sync.",
 				aliases: ["library", "remote repository"],
 				render: setting => {
 					setting.addButton(button => button
@@ -254,6 +256,16 @@ export class SeafileSettingTab extends PluginSettingTab {
 						.setButtonText("Open history")
 						.setCta()
 						.onClick(() => { void this.plugin.openHistoryView("activity"); }));
+				}
+			},
+			{
+				name: "Sync issues",
+				desc: "Review actionable conflicts, safety stops, recovered downloads, and errors that exhausted automatic retries.",
+				aliases: ["conflicts", "errors", "diagnostics"],
+				render: setting => {
+					const openCount = this.plugin.issues.list().filter(issue => !issue.resolved).length;
+					setting.setDesc(`${openCount} open issue${openCount === 1 ? "" : "s"}.`)
+						.addButton(button => button.setButtonText("Open").onClick(() => { void this.plugin.openHistoryView("issues"); }));
 				}
 			},
 			{
@@ -426,6 +438,39 @@ export class SeafileSettingTab extends PluginSettingTab {
 				}
 			},
 			{
+				name: "Mass-deletion protection",
+				desc: "Pause before a sync deletes many files locally or remotely. The default also catches 25% changes once at least 20 files are affected.",
+				aliases: ["deletion limit", "safety interlock"],
+				render: setting => {
+					setting.addToggle(toggle => toggle
+						.setValue(settings.deletionProtectionEnabled)
+						.onChange(async value => {
+							settings.deletionProtectionEnabled = value;
+							await this.plugin.saveSettings();
+						}));
+				}
+			},
+			{
+				name: "Mass-deletion file threshold",
+				desc: "Always request confirmation when at least this many files would be deleted.",
+				aliases: ["500 files", "deletion threshold"],
+				visible: () => settings.deletionProtectionEnabled,
+				render: setting => {
+					let value = settings.deletionProtectionFileThreshold.toString();
+					setting.addText(text => text.setValue(value).onChange(next => { value = next; }))
+						.addButton(button => button.setButtonText("Save").onClick(async () => {
+							const threshold = Number.parseInt(value, 10);
+							if (!Number.isFinite(threshold) || threshold < 1) {
+								new Notice("The deletion threshold must be at least 1.");
+								return;
+							}
+							settings.deletionProtectionFileThreshold = threshold;
+							await this.plugin.saveSettings();
+							new Notice("Mass-deletion threshold saved");
+						}));
+				}
+			},
+			{
 				name: "Seafile ignore file",
 				desc: `Edit ${SEAFILE_IGNORE_FILE} in the library root. The same rules are used by standard Seafile clients; the plugin creates this file automatically when necessary.`,
 				aliases: ["ignore list", "excluded files", "git folder"],
@@ -481,6 +526,44 @@ export class SeafileSettingTab extends PluginSettingTab {
 							settings.useFetch = value;
 							await this.plugin.saveSettings();
 						}));
+				}
+			},
+			{
+				name: "Verify vault",
+				desc: "Compare the vault, local sync index, and current Seafile metadata without changing files.",
+				aliases: ["health check", "diagnostics", "repair"],
+				render: setting => {
+					setting.addButton(button => button.setButtonText("Verify").onClick(async () => {
+						button.setDisabled(true);
+						try {
+							await this.plugin.verifyVault();
+						} catch (error) {
+							new Notice(`Vault verification failed: ${(error as Error).message}`);
+						} finally {
+							button.setDisabled(false);
+						}
+					}));
+				}
+			},
+			{
+				name: "Rebuild sync index",
+				desc: "Forget only the local Seafile baseline and safely merge the existing vault with the remote library again. Vault files are preserved.",
+				aliases: ["resync", "repair sync data", "reset index"],
+				render: setting => {
+					setting.addButton(button => button.setButtonText("Rebuild").setWarning().onClick(() => {
+						new Dialog(this.app,
+							"Rebuild sync index",
+							"This removes only the plugin's local synchronization index. Vault files remain in place. The next sync performs a fresh merge and may create conflict copies where local and remote files differ. Continue?",
+							async () => {
+								try {
+									await this.plugin.rebuildSyncIndex();
+									new Notice("Sync index rebuilt; a fresh merge has started.");
+								} catch (error) {
+									new Notice(`Could not rebuild sync index: ${(error as Error).message}`);
+								}
+							}
+						).open();
+					}));
 				}
 			},
 			{
@@ -551,7 +634,7 @@ export class SeafileSettingTab extends PluginSettingTab {
 			this.update();
 		}
 
-		new RepoModal(this.app, async ({ repoName, repoId, info }) => {
+		new RepoModal(this.app, async ({ repoName, repoId, permission, info }) => {
 			const replacingRepository = preserveVault && repoId !== oldRepoId;
 			const applyAndStart = async () => {
 				if (replacingRepository) {
@@ -561,6 +644,7 @@ export class SeafileSettingTab extends PluginSettingTab {
 				settings.repoName = repoName;
 				settings.repoId = repoId;
 				settings.repoToken = info.token;
+				settings.repoPermission = permission;
 				settings.encrypted = info.encrypted;
 				settings.encVersion = info.enc_version;
 				settings.repoSalt = info.salt;
@@ -607,6 +691,7 @@ export class SeafileSettingTab extends PluginSettingTab {
 		settings.repoName = "";
 		settings.repoId = "";
 		settings.repoToken = "";
+		settings.repoPermission = "";
 		settings.encrypted = false;
 		settings.encVersion = 0;
 		settings.repoSalt = "";
@@ -621,6 +706,8 @@ export class SeafileSettingTab extends PluginSettingTab {
 		if (status.type === "idle" && status.error) return `Retry scheduled: ${status.error}`;
 		if (status.type === "idle") return "Enabled and waiting for changes";
 		if (status.message === "repository-unavailable") return "Stopped because the configured repository is unavailable. Local files were preserved.";
+		if (status.message === "safety") return status.error ?? "Stopped by the mass-deletion safety interlock.";
+		if (status.message === "preflight") return status.error ?? "Stopped because a sync preflight check failed.";
 		if (status.message === "error") return "Stopped after repeated sync failures";
 		return "Enabled, but synchronization is stopped";
 	}
