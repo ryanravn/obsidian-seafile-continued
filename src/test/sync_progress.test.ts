@@ -54,8 +54,20 @@ describe("sync progress labels", () => {
 	test("shows metadata publication and local-state progress", () => {
 		expect(formatSyncActivity({
 			type: "busy", message: "upload",
+			progress: { operation: "check-metadata", completedItems: 1000, totalItems: 3320 }
+		})).toBe("Checking metadata 1000/3320");
+		expect(formatSyncActivity({
+			type: "busy", message: "upload",
+			progress: { operation: "prepare-metadata", completedItems: 400, totalItems: 3320 }
+		})).toBe("Preparing metadata 400/3320");
+		expect(formatSyncActivity({
+			type: "busy", message: "upload",
 			progress: { operation: "publish-metadata", completedItems: 1200, totalItems: 3320 }
 		})).toBe("Publishing metadata 1200/3320");
+		expect(formatSyncActivity({
+			type: "busy", message: "upload",
+			progress: { operation: "verify-metadata", completedItems: 2000, totalItems: 3320 }
+		})).toBe("Verifying metadata 2000/3320");
 		expect(formatSyncActivity({
 			type: "busy", message: "upload",
 			progress: { operation: "publish-commit", completedItems: 0, totalItems: 1 }
@@ -84,8 +96,8 @@ describe("sync progress planning", () => {
 			["same.md", { type: "file", size: 4, ctime: 0, mtime: 1700000000 * 1000 }],
 		]);
 		const stat = jest.fn(async (path: string) => path === "/"
-				? { type: "folder", size: 0, ctime: 0, mtime: 0 }
-				: files.get(path) ?? null);
+			? { type: "folder", size: 0, ctime: 0, mtime: 0 }
+			: files.get(path) ?? null);
 		const list = jest.fn(async () => ({ files: Array.from(files.keys()), folders: [] }));
 		const adapter = {
 			stat,

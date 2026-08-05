@@ -11,7 +11,7 @@ import RepoModal from "./repo_modal";
 import TokenLoginModal from "./token_login_modal";
 import { resolveNotificationUrl, type NotificationStatus } from "src/notification";
 import type { SyncStatus } from "src/sync/controller";
-import type { SyncStatusTextMode } from "src/settings";
+import type { HistoryGroupingMinutes, SyncStatusTextMode } from "src/settings";
 import { formatSyncActivity } from "./sync_progress";
 import { describeOnboardingStep, getOnboardingStep } from "./onboarding";
 
@@ -246,6 +246,114 @@ export class SeafileSettingTab extends PluginSettingTab {
 				}
 			},
 			{
+				name: "Sync history",
+				desc: "Browse grouped activity, per-file versions, deleted files, and whole-vault snapshots.",
+				aliases: ["version history", "snapshots", "deleted files", "restore"],
+				render: setting => {
+					setting.addButton(button => button
+						.setButtonText("Open history")
+						.setCta()
+						.onClick(() => { void this.plugin.openHistoryView("activity"); }));
+				}
+			},
+			{
+				name: "History grouping",
+				desc: "Visually combine nearby commits from the same author and device without changing Seafile's stored history.",
+				aliases: ["commit grouping", "activity sessions"],
+				render: setting => {
+					setting.addDropdown(dropdown => dropdown
+						.addOption("0", "No grouping")
+						.addOption("1", "1 minute")
+						.addOption("5", "5 minutes")
+						.addOption("15", "15 minutes")
+						.setValue(String(settings.historyGroupingMinutes))
+						.onChange(async value => {
+							settings.historyGroupingMinutes = Number(value) as HistoryGroupingMinutes;
+							await this.plugin.saveSettings();
+						}));
+				}
+			},
+			{
+				name: "Local offline checkpoints",
+				desc: "Keep deduplicated Markdown and Canvas checkpoints on this device. They are never synchronized as vault files.",
+				aliases: ["offline versions", "local history"],
+				render: setting => {
+					setting.addToggle(toggle => toggle
+						.setValue(settings.localHistoryEnabled)
+						.onChange(async value => {
+							settings.localHistoryEnabled = value;
+							await this.plugin.saveSettings();
+						}));
+				}
+			},
+			{
+				name: "Checkpoint interval",
+				desc: "Minutes between local recovery points during active editing.",
+				aliases: ["offline history frequency"],
+				visible: () => settings.localHistoryEnabled,
+				render: setting => {
+					setting.addText(text => text
+						.setPlaceholder("5")
+						.setValue(String(settings.localHistoryIntervalMinutes))
+						.onChange(async value => {
+							const interval = Number(value);
+							if (!Number.isFinite(interval) || interval < 1) return;
+							settings.localHistoryIntervalMinutes = interval;
+							await this.plugin.saveSettings();
+						}));
+				}
+			},
+			{
+				name: "Checkpoint retention",
+				desc: "Days to keep local recovery points.",
+				aliases: ["offline history age"],
+				visible: () => settings.localHistoryEnabled,
+				render: setting => {
+					setting.addText(text => text
+						.setPlaceholder("7")
+						.setValue(String(settings.localHistoryRetentionDays))
+						.onChange(async value => {
+							const days = Number(value);
+							if (!Number.isFinite(days) || days < 1) return;
+							settings.localHistoryRetentionDays = days;
+							await this.plugin.saveSettings();
+						}));
+				}
+			},
+			{
+				name: "Checkpoint storage limit",
+				desc: "Maximum device-local history storage in MiB. Content-identical checkpoints share storage.",
+				aliases: ["offline history size"],
+				visible: () => settings.localHistoryEnabled,
+				render: setting => {
+					setting.addText(text => text
+						.setPlaceholder("250")
+						.setValue(String(Math.round(settings.localHistoryMaxBytes / 1024 / 1024)))
+						.onChange(async value => {
+							const maxMiB = Number(value);
+							if (!Number.isFinite(maxMiB) || maxMiB < 1) return;
+							settings.localHistoryMaxBytes = maxMiB * 1024 * 1024;
+							await this.plugin.saveSettings();
+						}));
+				}
+			},
+			{
+				name: "Local history storage",
+				desc: "Checking local checkpoint storage…",
+				aliases: ["clear history", "checkpoint size"],
+				visible: () => settings.localHistoryEnabled,
+				render: setting => {
+					void this.plugin.checkpoints.getStorageBytes()
+						.then(bytes => { setting.setDesc(`${(bytes / 1024 / 1024).toFixed(1)} MiB used on this device.`); })
+						.catch(error => { setting.setDesc(`Could not read local history storage: ${(error as Error).message}`); });
+					setting.addButton(button => button.setButtonText("Clear local history").setDestructive().onClick(async () => {
+						await this.plugin.checkpoints.clear();
+						setting.setDesc("0.0 MiB used on this device.");
+						new Notice("Local checkpoint history cleared");
+					}));
+				}
+			},
+			{
 				name: "Realtime sync",
 				desc: this.describeNotificationStatus(this.plugin.notifications.status),
 				aliases: ["notifications", "WebSocket", "periodic fallback"],
@@ -377,7 +485,7 @@ export class SeafileSettingTab extends PluginSettingTab {
 			},
 			{
 				name: "Clear vault",
-				desc: "Delete all local files and synchronization data. Try this only when recovering from sync problems.",
+				desc: "Delete all local files, synchronization data, and local checkpoint history. Try this only when recovering from sync problems.",
 				aliases: ["reset sync", "delete local files"],
 				render: setting => {
 					setting.addButton(button => button

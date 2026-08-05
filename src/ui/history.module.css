@@ -1,0 +1,119 @@
+.layout {
+	display: grid;
+	grid-template-columns: minmax(15rem, 0.8fr) minmax(20rem, 2fr);
+	gap: 1rem;
+	min-height: 24rem;
+}
+
+.fileHistoryModal {
+	width: min(92vw, 75rem);
+	max-width: 92vw;
+}
+
+.modalLayout {
+	min-height: min(65vh, 45rem);
+}
+
+.embeddedPanel {
+	min-width: 0;
+}
+
+.embeddedLayout {
+	grid-template-columns: minmax(0, 1fr);
+	min-height: 0;
+}
+
+.embeddedLayout .timeline {
+	border-right: 0;
+	border-bottom: 1px solid var(--background-modifier-border);
+	max-height: 18rem;
+	padding-right: 0;
+	padding-bottom: 0.75rem;
+}
+
+.timeline {
+	border-right: 1px solid var(--background-modifier-border);
+	padding-right: 0.75rem;
+	overflow: auto;
+}
+
+.entry {
+	width: 100%;
+	text-align: left;
+	padding: 0.6rem;
+	margin-bottom: 0.35rem;
+	border-radius: var(--radius-s);
+	background: transparent;
+	box-shadow: none;
+}
+
+.entry:hover, .selected {
+	background: var(--background-modifier-hover);
+}
+
+.meta {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+}
+
+.preview {
+	overflow: auto;
+}
+
+.preview img {
+	max-width: 100%;
+	height: auto;
+}
+
+.diff {
+	font-family: var(--font-monospace);
+	white-space: pre-wrap;
+	font-size: var(--font-smaller);
+}
+
+.added {
+	background: rgba(var(--color-green-rgb), 0.16);
+	color: var(--text-success);
+}
+
+.removed {
+	background: rgba(var(--color-red-rgb), 0.16);
+	color: var(--text-error);
+}
+
+.toolbar {
+	display: flex;
+	gap: 0.5rem;
+	align-items: center;
+	margin-bottom: 0.75rem;
+	flex-wrap: wrap;
+}
+
+.activity {
+	padding: 0.7rem;
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.badge {
+	display: inline-block;
+	margin-left: 0.4rem;
+	padding: 0.1rem 0.35rem;
+	border-radius: var(--radius-s);
+	background: var(--background-modifier-hover);
+	font-size: var(--font-ui-smaller);
+}
+
+.danger {
+	color: var(--text-error);
+}
+
+@media (max-width: 700px) {
+	.layout {
+		grid-template-columns: 1fr;
+	}
+	.timeline {
+		border-right: 0;
+		border-bottom: 1px solid var(--background-modifier-border);
+		max-height: 14rem;
+	}
+}

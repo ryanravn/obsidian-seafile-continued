@@ -19,6 +19,7 @@ Compared with upstream release `0.3.22`, this fork currently adds:
 - **Faster large synchronizations** through bounded parallel block transfers, download prefetching, batched remote-object checks and local metadata updates, prepared-block reuse, and reduced finalization overhead.
 - **More useful sync feedback** with file-count progress across preparation, transfer, verification, publication, commit, and local-state phases, plus configurable sidebar status text and detailed hover status.
 - **Guided new-device onboarding** that walks through the server, account, remote library, and initial synchronization without requiring a preconfigured vault.
+- **Integrated version history and recovery** with per-file diffs, grouped library activity, deleted-file recovery, whole-vault snapshot previews and restore, plus optional device-local offline checkpoints.
 - **Hardened development automation** with pull-request CI, reproducible npm installs, tested release preparation, version consistency checks, artifact attestations, and immutable tag-based releases.
 
 ## Features
@@ -51,6 +52,22 @@ To trigger a sync immediately, click "Sync now" in the settings, or run "Seafile
 Realtime sync is enabled by default. It connects to `<server>/notification`; a different notification-server URL can be entered in settings. The status row shows whether the WebSocket is connected or periodic synchronization is currently providing the fallback. The Seafile server must have its notification service enabled and exposed through the reverse proxy.
 
 Per-file sync status and transfer progress are shown next to file names in the explorer. The text next to the sidebar sync button can be shown always, only during active synchronization (the default), or never; its complete hover tooltip is always retained. Development mode logs phase timings, transferred bytes, prepared-block reuse, and aggregate throughput to the developer console.
+
+## Version history and recovery
+
+Open **Seafile history** from the ribbon, plugin settings, or command palette. The history view has three sections:
+
+- **Activity** presents Seafile commits as editing sessions. Nearby commits by the same author and device are grouped for readability; this is only a UI view and never rewrites server history. Each normal sync cycle still creates one Seafile commit containing all changes published by that cycle.
+- **Vault snapshots** compares any retained library commit with the current remote HEAD before restoring it. The preview reports files that will be modified, restored, or removed and requires the library name as confirmation. The plugin synchronizes first, verifies that the remote HEAD did not change during review, and records the previous HEAD as an undo point. It uses Seafile's atomic library-revert API when permitted; read/write collaborators, encrypted libraries whose server-side password is unavailable, and older servers fall back to reconstructing the snapshot as a new plugin commit.
+- **Deleted files** uses Seafile's library trash, supports multi-select restore, and can preview the retained version of an individual file before recovery.
+
+Use the sidebar's **File versions** tab to select the active file, enter a vault-relative path, or follow a file path from Activity without leaving the history view. **Open Seafile version history** in a file's context menu opens the same timeline in a larger modal. Markdown, Canvas, and small text versions show a line diff against the current file; images show a preview, and other files show revision metadata. Restoring writes through Obsidian's adapter, preserves the historical modification time, and then enters the normal synchronization pipeline.
+
+Seafile only creates server versions when a commit reaches the server. To retain work while offline, enable **Local offline checkpoints** in plugin settings. The plugin periodically stores content-addressed checkpoints for Markdown and Canvas files inside its protected, device-specific plugin data. Interval, retention, and storage limit are configurable, identical content is deduplicated, and local history can be cleared independently. These checkpoints are not vault files and do not sync through Seafile.
+
+A local checkpoint can be restored without publication, or restored and published explicitly. Publication is allowed only when the remote HEAD still matches the checkpoint's recorded base; if another device changed the library, the plugin refuses direct publication and asks you to restore locally so ordinary synchronization and conflict handling remain in control. This gives offline recovery points without manufacturing misleading server history while disconnected.
+
+History availability is governed by the Seafile server's file-history and trash retention settings. Expired server versions cannot be reconstructed by the plugin. Local checkpoints complement that retention but remain available only on the device that created them.
 
 `seafile-ignore.txt` is created automatically when absent. Its rules prevent new matching local files from being uploaded; files already present on the server may still be downloaded, matching standard Seafile client behavior. The plugin installation and its device-specific synchronization database are always protected internally.
 

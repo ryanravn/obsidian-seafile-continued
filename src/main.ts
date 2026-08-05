@@ -1,4 +1,4 @@
-import { Notice, Plugin } from "obsidian";
+import { Notice, Plugin, TFile, normalizePath } from "obsidian";
 import { initConfig, PLUGIN_DIR } from "./config";
 import { SEAFILE_IGNORE_FILE } from "./ignore";
 import { RepoCrypto } from "./crypto";
@@ -11,6 +11,12 @@ import { Explorer } from "./ui/explorer";
 import PasswordModal from "./ui/password_modal";
 import { SeafileSettingTab } from "./ui/setting_tab";
 import { debug, disableDebugConsole } from "./utils";
+import { HistoryService } from "./history/service";
+import { LocalCheckpointStore } from "./history/checkpoint_store";
+import type { DeletedEntry, FileRevision, LocalCheckpoint, SnapshotDiff } from "./history/types";
+import { FileHistoryModal } from "./ui/file_history_modal";
+import { HISTORY_VIEW_TYPE, HistoryView } from "./ui/history_view";
+import { HttpError } from "./server";
 
 export default class SeafilePlugin extends Plugin {
 	settings: SeafileSettings;
@@ -18,6 +24,8 @@ export default class SeafilePlugin extends Plugin {
 	sync: SyncController;
 	explorerView: Explorer;
 	notifications: SeafileNotificationClient;
+	history: HistoryService;
+	checkpoints: LocalCheckpointStore;
 
 	async onload(): Promise<void> {
 		this.settings = await this.loadSettings();
@@ -25,11 +33,18 @@ export default class SeafilePlugin extends Plugin {
 		initConfig(this.app, this.server, this.manifest.id);
 
 		this.sync = new SyncController(this.app.vault.adapter, this.settings);
+		this.history = new HistoryService(this.server);
+		this.checkpoints = new LocalCheckpointStore(
+			this.app, this.app.vault.adapter, this.settings, this.manifest.id,
+			() => this.sync.getKnownRemoteHead()
+		);
+		this.register(() => this.checkpoints.dispose());
 		this.notifications = new SeafileNotificationClient(this.settings, this.server, () => this.sync.requestSync());
 		this.sync.onRepositoryUnavailable = () => this.notifications.stop();
 		this.explorerView = new Explorer(this, this.sync);
 
 		this.registerEvent(this.app.vault.on("create", (file) => {
+			this.checkpoints.schedule(file.path);
 			if (this.sync.status.type !== "stop") {
 				void this.sync.notifyChange("/" + file.path, "create");
 			}
@@ -46,15 +61,45 @@ export default class SeafilePlugin extends Plugin {
 			}
 		}));
 		this.registerEvent(this.app.vault.on("modify", (file) => {
+			this.checkpoints.schedule(file.path);
 			if (this.sync.status.type !== "stop") { void this.sync.notifyChange("/" + file.path, "modify"); }
 		}));
 
 		this.addSettingTab(new SeafileSettingTab(this.app, this));
+		this.registerView(HISTORY_VIEW_TYPE, leaf => new HistoryView(leaf, this));
+		this.addRibbonIcon("history", "Open Seafile history", () => { void this.openHistoryView(); });
+		this.registerEvent(this.app.workspace.on("file-menu", (menu, file) => {
+			if (!(file instanceof TFile)) return;
+			menu.addItem(item => item
+				.setTitle("Open Seafile version history")
+				.setIcon("history")
+				.onClick(() => this.openFileHistory(file.path)));
+		}));
 
 		this.addCommand({
 			id: "manual-sync",
 			name: "Sync now",
 			callback: async () => { await this.triggerManualSync(); },
+		});
+		this.addCommand({
+			id: "open-sync-history",
+			name: "Open sync history",
+			callback: () => { void this.openHistoryView("activity"); },
+		});
+		this.addCommand({
+			id: "open-file-history",
+			name: "Open version history for current file",
+			checkCallback: checking => {
+				const file = this.app.workspace.getActiveFile();
+				if (!file) return false;
+				if (!checking) void this.openHistoryView("file", file.path);
+				return true;
+			},
+		});
+		this.addCommand({
+			id: "open-vault-snapshots",
+			name: "Open vault snapshots",
+			callback: () => { void this.openHistoryView("snapshots"); },
 		});
 
 		if (this.settings.devMode) {
@@ -82,6 +127,141 @@ export default class SeafilePlugin extends Plugin {
 			// Don't block onload() on the password prompt or sync init —
 			// otherwise Obsidian shows "loading" until the user types the password.
 			void this.enableSync();
+		}
+	}
+
+	openFileHistory(path: string): void {
+		new FileHistoryModal(this.app, this, normalizePath(path)).open();
+	}
+
+	openDeletedFileHistory(entry: DeletedEntry): void {
+		const path = normalizePath(`${entry.parentDir}/${entry.name}`);
+		const revision: FileRevision = {
+			commitId: entry.commitId,
+			path: "/" + path,
+			createdAt: entry.deletedAt,
+			authorName: "",
+			authorEmail: "",
+			description: "Deleted file",
+			size: entry.size,
+			fileId: entry.objectId
+		};
+		new FileHistoryModal(this.app, this, path, revision).open();
+	}
+
+	async openHistoryView(tab: "activity" | "file" | "snapshots" | "deleted" = "activity", filePath = ""): Promise<void> {
+		let leaf = this.app.workspace.getLeavesOfType(HISTORY_VIEW_TYPE)[0];
+		if (!leaf) {
+			leaf = this.app.workspace.getRightLeaf(false) ?? this.app.workspace.getLeaf(true);
+			await leaf.setViewState({ type: HISTORY_VIEW_TYPE, active: true });
+		}
+		await this.app.workspace.revealLeaf(leaf);
+		if (leaf.view instanceof HistoryView) {
+			if (tab === "file" && filePath) await leaf.view.showFileHistory(filePath);
+			else await leaf.view.showTab(tab);
+		}
+	}
+
+	async restoreHistoricalFile(path: string, revision: FileRevision): Promise<void> {
+		const file = await this.history.readRevision(revision);
+		await this.writeRestoredFile(path, file.content, file.mtime * 1000);
+	}
+
+	async restoreLocalCheckpoint(checkpoint: LocalCheckpoint, publish: boolean): Promise<void> {
+		if (publish) {
+			const remoteHead = await this.server.getHeadCommitId();
+			if (checkpoint.baseRemoteHead && checkpoint.baseRemoteHead !== remoteHead) {
+				throw new Error("The remote library changed after this checkpoint was created. Restore it locally first and let normal conflict handling merge it.");
+			}
+		}
+		await this.writeRestoredFile(checkpoint.path, await this.checkpoints.read(checkpoint), checkpoint.createdAt);
+		if (publish) {
+			if (this.sync.status.type === "stop") await this.enableSync();
+			else this.sync.requestSync();
+			await this.sync.waitUntilIdle();
+			await this.checkpoints.markPublished(checkpoint.id, await this.server.getHeadCommitId());
+		}
+	}
+
+	async restoreVaultSnapshot(targetCommitId: string, diff: SnapshotDiff): Promise<void> {
+		if (!this.settings.enableSync) throw new Error("Enable synchronization before restoring a vault snapshot.");
+		this.sync.requestSync();
+		await this.sync.waitUntilIdle();
+		if (!this.sync.isLocallySynchronized()) throw new Error("The local vault still has pending changes.");
+
+		const previousHead = await this.server.getHeadCommitId();
+		if (previousHead === targetCommitId) throw new Error("This snapshot is already the current library state.");
+		this.notifications.stop();
+		await this.sync.stopSyncAsync();
+		const progress = new Notice("Restoring vault snapshot…", 0);
+		try {
+			const verifiedHead = await this.server.getHeadCommitId();
+			if (verifiedHead !== previousHead) throw new Error("The remote library changed while the snapshot was being reviewed. Refresh and try again.");
+			try {
+				await this.server.revertToCommit(targetCommitId);
+			} catch (error) {
+				// Seafile limits the atomic revert endpoint to library owners, and
+				// some older deployments do not expose it. A read/write collaborator
+				// can still reconstruct the reviewed snapshot as a normal new commit.
+				if (!(error instanceof HttpError && [403, 404, 405].includes(error.status))) throw error;
+				await this.restoreSnapshotLocally(targetCommitId, diff);
+			}
+			this.settings.lastSnapshotUndoCommit = previousHead;
+			await this.saveSettings();
+		} finally {
+			progress.hide();
+			if (this.settings.enableSync) await this.enableSync();
+		}
+	}
+
+	private async restoreSnapshotLocally(targetCommitId: string, diff: SnapshotDiff): Promise<void> {
+		const changedFiles = [...diff.modifiedFiles, ...diff.addedFiles];
+		const progress = new Notice(`Restoring vault snapshot 0/${changedFiles.length + diff.deletedFiles.length}…`, 0);
+		try {
+			for (const rawPath of [...diff.addedDirectories].sort((a, b) => a.length - b.length)) {
+				const path = normalizePath(rawPath.replace(/^\/+/, ""));
+				if (path && !await this.app.vault.adapter.exists(path)) await this.app.vault.adapter.mkdir(path);
+			}
+			let completed = 0;
+			for (const rawPath of changedFiles) {
+				const path = normalizePath(rawPath.replace(/^\/+/, ""));
+				const historical = await this.history.readFile(targetCommitId, rawPath);
+				await this.writeRestoredFile(path, historical.content, historical.mtime * 1000, false);
+				progress.setMessage(`Restoring vault snapshot ${++completed}/${changedFiles.length + diff.deletedFiles.length}…`);
+			}
+			for (const rawPath of diff.deletedFiles) {
+				const path = normalizePath(rawPath.replace(/^\/+/, ""));
+				await this.checkpoints.capture(path, true);
+				if (await this.app.vault.adapter.exists(path)) await this.app.vault.adapter.remove(path);
+				progress.setMessage(`Restoring vault snapshot ${++completed}/${changedFiles.length + diff.deletedFiles.length}…`);
+			}
+			for (const rawPath of [...diff.deletedDirectories].sort((a, b) => b.length - a.length)) {
+				const path = normalizePath(rawPath.replace(/^\/+/, ""));
+				if (!await this.app.vault.adapter.exists(path)) continue;
+				const remaining = await this.app.vault.adapter.list(path);
+				if (remaining.files.length === 0 && remaining.folders.length === 0) await this.app.vault.adapter.rmdir(path, false);
+			}
+		} finally {
+			progress.hide();
+		}
+	}
+
+	private async writeRestoredFile(path: string, content: ArrayBuffer, mtime: number, requestSync = true): Promise<void> {
+		path = normalizePath(path.replace(/^\/+/, ""));
+		const existed = await this.app.vault.adapter.exists(path);
+		await this.checkpoints.capture(path, true);
+		await this.ensureParentDirectories(path);
+		await this.app.vault.adapter.writeBinary(path, content, { mtime });
+		await this.sync.notifyChange("/" + path, existed ? "modify" : "create");
+		if (requestSync) this.sync.requestSync();
+	}
+
+	private async ensureParentDirectories(path: string): Promise<void> {
+		const parts = path.split("/").slice(0, -1);
+		let current = "";
+		for (const part of parts) {
+			current = current ? `${current}/${part}` : part;
+			if (!await this.app.vault.adapter.exists(current)) await this.app.vault.adapter.mkdir(current);
 		}
 	}
 
@@ -300,6 +480,12 @@ export default class SeafilePlugin extends Plugin {
 		if (!["always", "syncing", "never"].includes(settings.syncStatusTextMode)) {
 			settings.syncStatusTextMode = DEFAULT_SETTINGS.syncStatusTextMode;
 		}
+		if (![0, 1, 5, 15].includes(settings.historyGroupingMinutes)) {
+			settings.historyGroupingMinutes = DEFAULT_SETTINGS.historyGroupingMinutes;
+		}
+		if (!Number.isFinite(settings.localHistoryIntervalMinutes) || settings.localHistoryIntervalMinutes < 1) settings.localHistoryIntervalMinutes = 5;
+		if (!Number.isFinite(settings.localHistoryRetentionDays) || settings.localHistoryRetentionDays < 1) settings.localHistoryRetentionDays = 7;
+		if (!Number.isFinite(settings.localHistoryMaxBytes) || settings.localHistoryMaxBytes < 1024 * 1024) settings.localHistoryMaxBytes = 250 * 1024 * 1024;
 		return settings;
 	}
 

@@ -3,7 +3,7 @@ import { rm } from "fs/promises";
 import { initConfig } from "../config";
 import Server, { TYPE_FILE, type FileSeafFs } from "../server";
 import { DEFAULT_SETTINGS } from "../settings";
-import { SyncController, type NodeChange } from "../sync/controller";
+import { SyncController, type NodeChange, type SyncProgress } from "../sync/controller";
 import { SyncNode, type STATE_UPLOAD } from "../sync/node";
 import { SEAFILE_BLOCK_SIZE } from "../utils";
 
@@ -58,9 +58,10 @@ function setup(options: {
 		activeFsChecks--;
 		return new Map(ids.map(id => [id, !storedFs.has(id)]));
 	});
-	const sendPackFs = jest.fn(async (items: Array<[string, unknown]>) => {
+	const sendPackFs = jest.fn(async (items: Array<[string, unknown]>, onProgress?: (completed: number, total: number) => void) => {
 		activeFsUploads++;
 		maximumActiveFsUploads = Math.max(maximumActiveFsUploads, activeFsUploads);
+		onProgress?.(items.length, items.length);
 		await new Promise(resolve => setTimeout(resolve, options.fsOperationDelayMs ?? 0));
 		if (options.storeFs !== false) items.forEach(([id]) => storedFs.add(id));
 		activeFsUploads--;
@@ -405,9 +406,10 @@ describe("bounded large-file upload pipeline", () => {
 		const firstId = "a".repeat(40);
 		const secondId = "b".repeat(40);
 		const fs: FileSeafFs = { block_ids: ["block"], size: 1, type: TYPE_FILE, version: 1 };
+		const preparationProgress: Array<[number, number]> = [];
 
 		try {
-			await client.sendPackFs([[firstId, fs], [secondId, fs]]);
+			await client.sendPackFs([[firstId, fs], [secondId, fs]], (completed, total) => preparationProgress.push([completed, total]));
 
 			const body = fetchMock.mock.calls[0][1]?.body as ArrayBuffer;
 			const decoder = new TextDecoder();
@@ -417,6 +419,7 @@ describe("bounded large-file upload pipeline", () => {
 			expect(decoder.decode(body.slice(secondOffset, secondOffset + 40))).toBe(secondId);
 			const secondSize = new DataView(body, secondOffset + 40, 4).getUint32(0);
 			expect(secondOffset + 44 + secondSize).toBe(body.byteLength);
+			expect(preparationProgress).toEqual([[2, 2]]);
 		} finally {
 			delete (globalThis as { window?: unknown }).window;
 		}
@@ -431,15 +434,17 @@ describe("bounded large-file upload pipeline", () => {
 			state: { type: "upload", param: { progress: 0, fs } }
 		}));
 		const internal = sync as unknown as {
-			uploadFilesystemObjects: (uploads: SyncNode[], onProgress: (completed: number, total: number) => void) => Promise<void>
+			uploadFilesystemObjects: (uploads: SyncNode[], onProgress: (progress: SyncProgress) => void) => Promise<void>
 		};
-		const progress: Array<[number, number]> = [];
+		const progress: SyncProgress[] = [];
 
-		await internal.uploadFilesystemObjects(nodes as unknown as SyncNode[], (completed, total) => progress.push([completed, total]));
+		await internal.uploadFilesystemObjects(nodes as unknown as SyncNode[], value => progress.push(value));
 
 		expect(getMaximumActiveFsChecks()).toBe(3);
 		expect(getMaximumActiveFsUploads()).toBe(4);
-		expect(progress[0]).toEqual([0, nodes.length]);
-		expect(progress[progress.length - 1]).toEqual([nodes.length, nodes.length]);
+		expect(progress[0]).toEqual({ operation: "check-metadata", completedItems: 0, totalItems: nodes.length });
+		expect(progress.some(value => value.operation === "prepare-metadata" && "completedItems" in value && value.completedItems > 0)).toBe(true);
+		expect(progress.some(value => value.operation === "verify-metadata")).toBe(true);
+		expect(progress[progress.length - 1]).toEqual({ operation: "publish-metadata", completedItems: nodes.length, totalItems: nodes.length });
 	});
 });

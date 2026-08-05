@@ -35,7 +35,7 @@ export type SyncProgress = {
   completedBlocks: number
   totalBlocks: number
 } | {
-  operation: "publish-metadata" | "publish-commit" | "save-state" | "compact-state"
+  operation: "check-metadata" | "prepare-metadata" | "publish-metadata" | "verify-metadata" | "publish-commit" | "save-state" | "compact-state"
   completedItems: number
   totalItems: number
 }
@@ -1075,9 +1075,11 @@ export class SyncController {
 		return missing;
 	}
 
-	private async findMissingFilesystemObjects(fsIds: string[]): Promise<Set<string>> {
+	private async findMissingFilesystemObjects(fsIds: string[], onProgress?: (completed: number, total: number) => void): Promise<Set<string>> {
 		const missing = new Set<string>();
 		let nextOffset = 0;
+		let completed = 0;
+		onProgress?.(0, fsIds.length);
 		const worker = async (): Promise<void> => {
 			while (nextOffset < fsIds.length) {
 				const offset = nextOffset;
@@ -1089,6 +1091,8 @@ export class SyncController {
 					if (value === undefined) throw new Error(`Seafile returned no status for filesystem object '${id}'.`);
 					if (value) missing.add(id);
 				}
+				completed += batch.length;
+				onProgress?.(completed, fsIds.length);
 			}
 		};
 		const batchCount = Math.ceil(fsIds.length / SyncController.BLOCK_CHECK_BATCH_SIZE);
@@ -1276,7 +1280,7 @@ export class SyncController {
 		this.clearPreparedBlocks();
 	}
 
-	private async uploadFilesystemObjects(uploads: SyncNode[], onProgress?: (completed: number, total: number) => void): Promise<void> {
+	private async uploadFilesystemObjects(uploads: SyncNode[], onProgress?: (progress: SyncProgress) => void): Promise<void> {
 		const objects = new Map<string, { fs: SeafFs, path: string }>();
 		for (const node of uploads) {
 			if (node.state.type === "upload" && node.state.param.fs && node.next) {
@@ -1284,25 +1288,40 @@ export class SyncController {
 			}
 		}
 		const total = objects.size;
-		onProgress?.(0, total);
-
-		let missing = await this.findMissingFilesystemObjects(Array.from(objects.keys()));
+		let missing = await this.findMissingFilesystemObjects(Array.from(objects.keys()), (completedItems, totalItems) => {
+			onProgress?.({ operation: "check-metadata", completedItems, totalItems });
+		});
 		const alreadyStored = total - missing.size;
 		let published = 0;
-		onProgress?.(alreadyStored, total);
+		if (missing.size === 0) onProgress?.({ operation: "publish-metadata", completedItems: total, totalItems: total });
 		for (let attempt = 0; missing.size > 0 && attempt < SyncController.OBJECT_UPLOAD_ATTEMPTS; attempt++) {
 			const items = Array.from(missing, id => [id, objects.get(id)!.fs] as [string, SeafFs]);
 			let nextOffset = 0;
+			let prepared = 0;
+			let publishingStarted = alreadyStored > 0 || attempt > 0;
+			if (publishingStarted) {
+				onProgress?.({ operation: "publish-metadata", completedItems: alreadyStored + published, totalItems: total });
+			} else {
+				onProgress?.({ operation: "prepare-metadata", completedItems: 0, totalItems: items.length });
+			}
 			const worker = async (): Promise<void> => {
 				while (nextOffset < items.length) {
 					const offset = nextOffset;
 					nextOffset += SyncController.FS_UPLOAD_BATCH_SIZE;
 					const batch = items.slice(offset, offset + SyncController.FS_UPLOAD_BATCH_SIZE);
-					await server.sendPackFs(batch);
+					let batchPrepared = 0;
+					await server.sendPackFs(batch, completedItems => {
+						prepared += completedItems - batchPrepared;
+						batchPrepared = completedItems;
+						if (!publishingStarted) {
+							onProgress?.({ operation: "prepare-metadata", completedItems: prepared, totalItems: items.length });
+						}
+					});
+					publishingStarted = true;
 					if (attempt === 0) {
 						published += batch.length;
-						onProgress?.(Math.min(total, alreadyStored + published), total);
 					}
+					onProgress?.({ operation: "publish-metadata", completedItems: Math.min(total, alreadyStored + published), totalItems: total });
 				}
 			};
 			const batchCount = Math.ceil(items.length / SyncController.FS_UPLOAD_BATCH_SIZE);
@@ -1310,13 +1329,15 @@ export class SyncController {
 				{ length: Math.min(SyncController.FS_OPERATION_CONCURRENCY, batchCount) },
 				async () => await worker()
 			));
-			missing = await this.findMissingFilesystemObjects(Array.from(missing));
+			missing = await this.findMissingFilesystemObjects(Array.from(missing), (completedItems, totalItems) => {
+				onProgress?.({ operation: "verify-metadata", completedItems, totalItems });
+			});
 		}
 		if (missing.size > 0) {
 			const id = missing.values().next().value as string;
 			throw new Error(`Seafile did not store filesystem object '${id}' for '${objects.get(id)?.path}'. The commit was not published.`);
 		}
-		onProgress?.(total, total);
+		onProgress?.({ operation: "publish-metadata", completedItems: total, totalItems: total });
 	}
 
 	async push (nodeRoot: SyncNode, changes: NodeChange[], parentCommitId: string): Promise<string> {
@@ -1344,20 +1365,33 @@ export class SyncController {
 		await this.uploadFileObjects(fileUploads);
 		if (this.status.type === "busy") this.status.progress = undefined;
 		await this.measurePhase("publish filesystem objects", async () => {
-			await this.uploadFilesystemObjects(uploads, (completedItems, totalItems) => {
-				this.reportProgress({ operation: "publish-metadata", completedItems, totalItems });
-			});
+			await this.uploadFilesystemObjects(uploads, progress => { this.reportProgress(progress); });
 		});
 
 		// Create commit
+		const addedFiles = changes.filter(c => c.type == "add" && c.node.next!.mode == MODE_FILE);
+		const removedFiles = changes.filter(c => c.type == "remove-file");
+		const addedDirectories = changes.filter(c => c.type == "add" && c.node.next!.mode == MODE_DIR);
+		const removedDirectories = changes.filter(c => c.type == "remove-folder");
+		const renamedAdded = new Set<NodeChange>();
+		const renamedRemoved = new Set<NodeChange>();
+		const pairRenames = (added: NodeChange[], removed: NodeChange[]) => removed.flatMap(oldChange => {
+			const newChange = added.find(candidate => !renamedAdded.has(candidate) && candidate.node.next?.id === oldChange.node.prev?.id);
+			if (!newChange) return [];
+			renamedAdded.add(newChange);
+			renamedRemoved.add(oldChange);
+			return [{ from: oldChange.node.path, to: newChange.node.path }];
+		});
+		const renamedFiles = pairRenames(addedFiles, removedFiles);
+		const renamedDirectories = pairRenames(addedDirectories, removedDirectories);
 		const description = server.describeCommit({
-			addedFiles: changes.filter(c => c.type == "add" && c.node.next!.mode == MODE_FILE).map(c => c.node.name),
-			removedFiles: changes.filter(c => c.type == "remove-file").map(c => c.node.name),
-			modifiedFiles: changes.filter(c => c.type == "modify" && c.node.next!.mode == MODE_FILE).map(c => c.node.name),
-			addedDirectories: changes.filter(c => c.type == "add" && c.node.next!.mode == MODE_DIR).map(c => c.node.name),
-			removedDirectories: changes.filter(c => c.type == "remove-folder").map(c => c.node.name),
-			renamedFiles: [],
-			renamedDirectories: []
+			addedFiles: addedFiles.filter(c => !renamedAdded.has(c)).map(c => c.node.path),
+			removedFiles: removedFiles.filter(c => !renamedRemoved.has(c)).map(c => c.node.path),
+			modifiedFiles: changes.filter(c => c.type == "modify" && c.node.next!.mode == MODE_FILE).map(c => c.node.path),
+			addedDirectories: addedDirectories.filter(c => !renamedAdded.has(c)).map(c => c.node.path),
+			removedDirectories: removedDirectories.filter(c => !renamedRemoved.has(c)).map(c => c.node.path),
+			renamedFiles,
+			renamedDirectories
 		});
 		this.reportProgress({ operation: "publish-commit", completedItems: 0, totalItems: 1 });
 		const commit = await this.measurePhase("publish commit", async () => {
@@ -1507,6 +1541,36 @@ export class SyncController {
 		this.statusListeners.add(listener);
 		listener(this.status);
 		return () => this.statusListeners.delete(listener);
+	}
+
+	public getKnownRemoteHead(): string {
+		return this.localHead ?? "";
+	}
+
+	public isLocallySynchronized(): boolean {
+		return this.status.type === "idle" && this.nodeRoot?.state.type === "sync";
+	}
+
+	public async waitUntilIdle(timeoutMs = 5 * 60 * 1000): Promise<void> {
+		if (this.status.type === "idle") return;
+		if (this.status.type === "stop") throw new Error("Synchronization is stopped.");
+		await new Promise<void>((resolve, reject) => {
+			const timeout = window.setTimeout(() => {
+				unsubscribe();
+				reject(new Error("Timed out waiting for synchronization to finish."));
+			}, timeoutMs);
+			const unsubscribe = this.subscribeStatus(status => {
+				if (status.type === "idle") {
+					window.clearTimeout(timeout);
+					unsubscribe();
+					resolve();
+				} else if (status.type === "stop") {
+					window.clearTimeout(timeout);
+					unsubscribe();
+					reject(new Error(status.error ?? "Synchronization stopped."));
+				}
+			});
+		});
 	}
 
 	startSync () {

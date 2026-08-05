@@ -8,6 +8,7 @@ import * as utils from "./utils";
 import pako from "pako";
 import { posix as Path } from "path-browserify";
 import { type RepoCrypto } from "./crypto";
+import type { DeletedEntry, FileRevision, LibraryRevision, SnapshotEntry } from "./history/types";
 
 export const ZeroFs = "0000000000000000000000000000000000000000";
 export type SeafFs = FileSeafFs | DirSeafFs
@@ -135,11 +136,11 @@ export interface DirInfo {
 export interface CommitChanges {
   addedFiles: string[]
   removedFiles: string[]
-  renamedFiles: string[]
+  renamedFiles: Array<{ from: string, to: string }>
   modifiedFiles: string[]
   addedDirectories: string[]
   removedDirectories: string[]
-  renamedDirectories: string[]
+  renamedDirectories: Array<{ from: string, to: string }>
 }
 
 export class MfaRequiredError extends Error {
@@ -174,6 +175,7 @@ export interface RepoDownloadInfo {
 
 export default class Server {
 	private static readonly REQUEST_TIMEOUT_MS = 120 * 1000;
+	private static readonly FS_PACK_YIELD_INTERVAL = 25;
 	public crypto: RepoCrypto | null = null;
 
 	public constructor (private readonly settings: SeafileSettings,
@@ -493,6 +495,135 @@ export default class Server {
 		return downloadResp.arrayBuffer();
 	}
 
+	async getFileHistory(remotePath: string, startCommit = "", limit = 50): Promise<{ revisions: FileRevision[], nextCommit: string | null }> {
+		const query = new URLSearchParams({ path: remotePath, limit: String(limit) });
+		if (startCommit) query.set("commit_id", startCommit);
+		const response = await this.requestAPIv21({
+			url: `repos/${this.settings.repoId}/file/history/?${query.toString()}`
+		}) as {
+			data?: Array<{
+				commit_id?: unknown, path?: unknown, ctime?: unknown, creator_name?: unknown,
+				creator_email?: unknown, description?: unknown, size?: unknown, rev_file_id?: unknown,
+				rev_renamed_old_path?: unknown
+			}>,
+			next_start_commit?: unknown
+		};
+
+		const revisions = (response.data ?? []).flatMap(item => {
+			if (typeof item.commit_id !== "string" || typeof item.ctime !== "string") return [];
+			return [{
+				commitId: item.commit_id,
+				path: typeof item.path === "string" ? item.path : remotePath,
+				createdAt: Date.parse(item.ctime),
+				authorName: typeof item.creator_name === "string" ? item.creator_name : "",
+				authorEmail: typeof item.creator_email === "string" ? item.creator_email : "",
+				description: typeof item.description === "string" ? item.description : "",
+				size: typeof item.size === "number" ? item.size : Number(item.size) || 0,
+				fileId: typeof item.rev_file_id === "string" ? item.rev_file_id : "",
+				renamedFrom: typeof item.rev_renamed_old_path === "string" && item.rev_renamed_old_path ? item.rev_renamed_old_path : undefined
+			}];
+		});
+		return {
+			revisions,
+			nextCommit: typeof response.next_start_commit === "string" && response.next_start_commit
+				? response.next_start_commit
+				: null
+		};
+	}
+
+	async getLibraryHistory(page = 1, perPage = 50): Promise<{ revisions: LibraryRevision[], more: boolean }> {
+		const query = new URLSearchParams({ page: String(page), per_page: String(perPage) });
+		const response = await this.requestAPIv21({
+			url: `repos/${this.settings.repoId}/history/?${query.toString()}`
+		}) as {
+			data?: Array<{
+				commit_id?: unknown, time?: unknown, name?: unknown, email?: unknown, description?: unknown,
+				client_version?: unknown, device_name?: unknown, second_parent_id?: unknown, tags?: unknown
+			}>,
+			more?: unknown
+		};
+		const revisions = (response.data ?? []).flatMap(item => {
+			if (typeof item.commit_id !== "string" || typeof item.time !== "string") return [];
+			return [{
+				commitId: item.commit_id,
+				createdAt: Date.parse(item.time),
+				authorName: typeof item.name === "string" ? item.name : "",
+				authorEmail: typeof item.email === "string" ? item.email : "",
+				description: typeof item.description === "string" ? item.description : "",
+				clientVersion: typeof item.client_version === "string" ? item.client_version : "",
+				deviceName: typeof item.device_name === "string" ? item.device_name : "",
+				secondParentId: typeof item.second_parent_id === "string" && item.second_parent_id ? item.second_parent_id : undefined,
+				tags: Array.isArray(item.tags) ? item.tags.filter((tag): tag is string => typeof tag === "string") : []
+			}];
+		});
+		return { revisions, more: response.more === true };
+	}
+
+	async getSnapshotDirectory(commitId: string, remotePath = "/"): Promise<SnapshotEntry[]> {
+		const query = new URLSearchParams({ path: remotePath });
+		const response = await this.requestAPIv21({
+			url: `repos/${this.settings.repoId}/commits/${encodeURIComponent(commitId)}/dir/?${query.toString()}`
+		}) as {
+			dirent_list?: Array<{ type?: unknown, parent_dir?: unknown, obj_id?: unknown, name?: unknown, size?: unknown }>
+		};
+		return (response.dirent_list ?? []).flatMap(item => {
+			if ((item.type !== "file" && item.type !== "dir") || typeof item.name !== "string" || typeof item.obj_id !== "string") return [];
+			return [{
+				type: item.type,
+				parentDir: typeof item.parent_dir === "string" ? item.parent_dir : remotePath,
+				name: item.name,
+				objectId: item.obj_id,
+				size: typeof item.size === "number" ? item.size : Number(item.size) || 0
+			}];
+		});
+	}
+
+	async getDeletedEntries(page = 1, perPage = 100): Promise<{ entries: DeletedEntry[], totalCount: number }> {
+		const query = new URLSearchParams({ page: String(page), per_page: String(perPage) });
+		const response = await this.requestAPIv21({
+			url: `repos/${this.settings.repoId}/trash2/?${query.toString()}`
+		}) as {
+			items?: Array<{
+				parent_dir?: unknown, obj_name?: unknown, deleted_time?: unknown, commit_id?: unknown,
+				is_dir?: unknown, size?: unknown, obj_id?: unknown
+			}>,
+			total_count?: unknown
+		};
+		const entries = (response.items ?? []).flatMap(item => {
+			if (typeof item.obj_name !== "string" || typeof item.commit_id !== "string" || typeof item.deleted_time !== "string") return [];
+			return [{
+				parentDir: typeof item.parent_dir === "string" ? item.parent_dir : "/",
+				name: item.obj_name,
+				deletedAt: Date.parse(item.deleted_time),
+				commitId: item.commit_id,
+				isDirectory: item.is_dir === true,
+				size: typeof item.size === "number" ? item.size : Number(item.size) || 0,
+				objectId: typeof item.obj_id === "string" ? item.obj_id : ""
+			}];
+		});
+		return { entries, totalCount: typeof response.total_count === "number" ? response.total_count : entries.length };
+	}
+
+	async restoreDeletedEntries(entries: Array<{ commitId: string, path: string }>): Promise<{ success: string[], failed: Array<{ path: string, error: string }> }> {
+		const grouped: Record<string, string[]> = {};
+		for (const entry of entries) (grouped[entry.commitId] ??= []).push(entry.path);
+		const response = await this.requestAPIv21({
+			url: `repos/${this.settings.repoId}/trash2/revert/`,
+			method: "POST",
+			body: JSON.stringify(grouped),
+			contentType: "application/json"
+		}) as {
+			success?: Array<{ path?: unknown }>,
+			failed?: Array<{ path?: unknown, error_msg?: unknown }>
+		};
+		return {
+			success: (response.success ?? []).flatMap(item => typeof item.path === "string" ? [item.path] : []),
+			failed: (response.failed ?? []).flatMap(item => typeof item.path === "string"
+				? [{ path: item.path, error: typeof item.error_msg === "string" ? item.error_msg : "Restore failed" }]
+				: [])
+		};
+	}
+
 	async renameFile (oldPath: string, newName: string) {
 		oldPath = encodeURIComponent(oldPath);
 		newName = encodeURIComponent(newName);
@@ -704,7 +835,8 @@ export default class Server {
 			summary += "Deleted " + formatChange(changes.removedFiles.length, changes.removedFiles[0]);
 		}
 		if (changes.renamedFiles.length > 0) {
-			summary += "Renamed " + formatChange(changes.renamedFiles.length, changes.renamedFiles[0]);
+			const first = changes.renamedFiles[0];
+			summary += `Renamed "${first.from}" to "${first.to}"${changes.renamedFiles.length > 1 ? ` and ${changes.renamedFiles.length - 1} more files` : ""}.\n`;
 		}
 		if (changes.addedDirectories.length > 0) {
 			summary += "Added " + formatChange(changes.addedDirectories.length, changes.addedDirectories[0], true);
@@ -713,7 +845,8 @@ export default class Server {
 			summary += "Removed " + formatChange(changes.removedDirectories.length, changes.removedDirectories[0], true);
 		}
 		if (changes.renamedDirectories.length > 0) {
-			summary += "Renamed " + formatChange(changes.renamedDirectories.length, changes.renamedDirectories[0], true);
+			const first = changes.renamedDirectories[0];
+			summary += `Renamed directory "${first.from}" to "${first.to}"${changes.renamedDirectories.length > 1 ? ` and ${changes.renamedDirectories.length - 1} more directories` : ""}.\n`;
 		}
 
 		return summary.trim();
@@ -769,14 +902,15 @@ export default class Server {
 		utils.packRequest<string, SeafFsResult>((fsList: string[]) => this.getPackFs(fsList), 10, 200, 100)
 		, 1000);
 
-	async sendPackFs (fsList: SeafFsResult[]): Promise<Map<SeafFsResult, boolean>> {
+	async sendPackFs (fsList: SeafFsResult[], onProgress?: (completedItems: number, totalItems: number) => void): Promise<Map<SeafFsResult, boolean>> {
 		const result = new Map<SeafFsResult, boolean>();
 
 		// Prepare fs data
 		const utf8Encoder = new TextEncoder();
 		const chunks: Uint8Array[] = [];
 		let totalSize = 0;
-		for (const task of fsList) {
+		for (let index = 0; index < fsList.length; index++) {
+			const task = fsList[index];
 			const [fsId, fs] = task;
 			if (!fs) {
 				result.set(task, false);
@@ -793,6 +927,13 @@ export default class Server {
 				combinedData.set(new Uint8Array(compressed), idData.byteLength + sizeBuffer.byteLength);
 				chunks.push(combinedData);
 				totalSize += combinedData.byteLength;
+			}
+			const completedItems = index + 1;
+			if (completedItems % Server.FS_PACK_YIELD_INTERVAL === 0 || completedItems === fsList.length) {
+				onProgress?.(completedItems, fsList.length);
+				if (completedItems < fsList.length) {
+					await new Promise<void>(resolve => window.setTimeout(resolve, 0));
+				}
 			}
 		}
 		const data = new Uint8Array(totalSize);

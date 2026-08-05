@@ -1,4 +1,5 @@
 export type SyncStatusTextMode = "always" | "syncing" | "never"
+export type HistoryGroupingMinutes = 0 | 1 | 5 | 15
 
 export interface SeafileSettings {
   host: string
@@ -15,7 +16,13 @@ export interface SeafileSettings {
   useFetch: boolean
   enableNotifications: boolean
   notificationUrl: string
-  syncStatusTextMode: SyncStatusTextMode
+	syncStatusTextMode: SyncStatusTextMode
+	historyGroupingMinutes: HistoryGroupingMinutes
+	localHistoryEnabled: boolean
+	localHistoryIntervalMinutes: number
+	localHistoryRetentionDays: number
+	localHistoryMaxBytes: number
+	lastSnapshotUndoCommit: string
 
   // Encryption metadata (public, server-supplied). Password is never persisted.
   encrypted: boolean
@@ -41,6 +48,12 @@ export const DEFAULT_SETTINGS: SeafileSettings = {
 	enableNotifications: true,
 	notificationUrl: "",
 	syncStatusTextMode: "syncing",
+	historyGroupingMinutes: 5,
+	localHistoryEnabled: false,
+	localHistoryIntervalMinutes: 5,
+	localHistoryRetentionDays: 7,
+	localHistoryMaxBytes: 250 * 1024 * 1024,
+	lastSnapshotUndoCommit: "",
 	encrypted: false,
 	encVersion: 0,
 	repoSalt: "",

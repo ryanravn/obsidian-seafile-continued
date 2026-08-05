@@ -18,9 +18,16 @@ export function formatSyncActivity(status: SYNC_BUSY): string {
 		return `${verb} blocks ${progress.completedBlocks}/${progress.totalBlocks}`;
 	}
 	if ("completedItems" in progress) {
-		const verb = progress.operation === "publish-metadata" ? "Publishing metadata"
-			: progress.operation === "publish-commit" ? "Publishing commit"
-				: progress.operation === "compact-state" ? "Compacting state" : "Saving state";
+		const labels: Record<typeof progress.operation, string> = {
+			"check-metadata": "Checking metadata",
+			"prepare-metadata": "Preparing metadata",
+			"publish-metadata": "Publishing metadata",
+			"verify-metadata": "Verifying metadata",
+			"publish-commit": "Publishing commit",
+			"save-state": "Saving state",
+			"compact-state": "Compacting state"
+		};
+		const verb = labels[progress.operation];
 		return `${verb} ${progress.completedItems}/${progress.totalItems}`;
 	}
 
