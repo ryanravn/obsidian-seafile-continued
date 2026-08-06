@@ -16,7 +16,7 @@ export class SnapshotRestoreModal extends Modal {
 			text: `This will restore ${this.plugin.settings.repoName} to ${new Date(this.revision.createdAt).toLocaleString()} on every connected device.`
 		});
 		this.contentEl.createEl("p", {
-			text: `${this.diff.modifiedFiles.length} modified, ${this.diff.addedFiles.length} restored, and ${this.diff.deletedFiles.length} removed files.`,
+			text: `${this.diff.modifiedFileChanges.filter(change => change.contentChanged !== false).length} content-modified, ${this.diff.modifiedFileChanges.filter(change => change.contentChanged === false).length} metadata-updated, ${this.diff.addedFiles.length} restored, and ${this.diff.deletedFiles.length} removed files.`,
 		});
 		this.contentEl.createEl("p", {
 			text: "Finish synchronization on other devices first. The current remote HEAD will be retained as an undo point."
@@ -27,7 +27,7 @@ export class SnapshotRestoreModal extends Modal {
 		new Setting(this.contentEl)
 			.addButton(button => {
 				this.confirmButton = button;
-				button.setButtonText("Restore vault").setWarning().setDisabled(true).onClick(async () => {
+				button.setButtonText("Restore vault").setDestructive().setCta().setDisabled(true).onClick(async () => {
 					button.setDisabled(true);
 					try {
 						await this.plugin.restoreVaultSnapshot(this.revision.commitId, this.diff);

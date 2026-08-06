@@ -71,4 +71,30 @@ describe("local checkpoint store", () => {
 		expect(capture).toHaveBeenCalledWith("checkpoint-note.md");
 		store.dispose();
 	});
+
+	test("removes stale index entries whose checkpoint objects are missing", async () => {
+		await global.app.vault.adapter.write("checkpoint-note.md", "recoverable");
+		const store = new LocalCheckpointStore(
+			{ vault: { configDir: ".obsidian" } } as never,
+			global.app.vault.adapter,
+			settings(),
+			pluginId,
+			() => "remote-a"
+		);
+		const checkpoint = await store.capture("checkpoint-note.md");
+		await global.app.vault.adapter.remove(`${root}/history/objects/${checkpoint!.objectId}`);
+
+		await expect(store.read(checkpoint!)).rejects.toThrow("stale history entry was removed");
+		expect(await store.list("checkpoint-note.md")).toEqual([]);
+		expect(await store.getStorageBytes()).toBe(0);
+
+		const reloaded = new LocalCheckpointStore(
+			{ vault: { configDir: ".obsidian" } } as never,
+			global.app.vault.adapter,
+			settings(),
+			pluginId,
+			() => "remote-a"
+		);
+		expect(await reloaded.list()).toEqual([]);
+	});
 });

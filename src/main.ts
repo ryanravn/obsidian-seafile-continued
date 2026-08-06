@@ -120,16 +120,6 @@ export default class SeafilePlugin extends Plugin {
 
 		if (this.settings.devMode) {
 			(window as unknown as Record<string, unknown>)["seafile"] = this; // for debug
-			this.addRibbonIcon("trash-2", "Clear vault", async () => {
-				await this.clearVault();
-			});
-			this.addRibbonIcon("play-circle", "Start sync", async () => {
-				this.sync.startSync();
-			});
-
-			this.addRibbonIcon("stop-circle", "Stop sync", async () => {
-				await this.sync.stopSyncAsync();
-			});
 		} else {
 			disableDebugConsole();
 		}
@@ -160,7 +150,8 @@ export default class SeafilePlugin extends Plugin {
 			authorEmail: "",
 			description: "Deleted file",
 			size: entry.size,
-			fileId: entry.objectId
+			fileId: entry.objectId,
+			deleted: true
 		};
 		new FileHistoryModal(this.app, this, path, revision).open();
 	}

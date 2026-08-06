@@ -150,12 +150,68 @@ export class MfaRequiredError extends Error {
 }
 
 export class HttpError extends Error {
-	constructor(public readonly status: number, public readonly response: unknown) {
-		const detail = response && typeof response === "object" && "error_msg" in response && typeof response.error_msg === "string"
-			? response.error_msg
-			: JSON.stringify(response);
-		super(`HTTP ${status}. Response: ${detail}`);
+	constructor(
+		public readonly status: number,
+		public readonly response: unknown,
+		public readonly requestContext = ""
+	) {
+		super(`HTTP ${status}${requestContext ? ` during ${requestContext}` : ""}: ${formatHttpErrorResponse(response)}`);
 	}
+}
+
+function formatHttpErrorResponse(response: unknown): string {
+	if (response && typeof response === "object") {
+		const record = response as Record<string, unknown>;
+		for (const field of ["error_msg", "error", "detail", "message"] as const) {
+			if (typeof record[field] === "string" && record[field].trim()) {
+				return truncateErrorDetail(record[field].trim());
+			}
+		}
+	}
+	if (typeof response === "string") {
+		const text = response.trim();
+		if (/<(?:!doctype\s+html|html|body)(?:\s|>)/i.test(text)) {
+			const title = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(text)?.[1]
+				?.replace(/<[^>]+>/g, " ")
+				.replace(/\s+/g, " ")
+				.trim();
+			return title
+				? `Server returned an HTML error page (${truncateErrorDetail(title)}).`
+				: "Server returned an HTML error page.";
+		}
+		return text ? truncateErrorDetail(text) : "Empty response.";
+	}
+	if (response === null || response === undefined) return "Empty response.";
+	try {
+		return truncateErrorDetail(JSON.stringify(response));
+	} catch {
+		return "Unrecognized response.";
+	}
+}
+
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function isUnknownArray(value: unknown): value is unknown[] {
+	return Array.isArray(value);
+}
+
+function truncateErrorDetail(detail: string, maxLength = 300): string {
+	return detail.length <= maxLength ? detail : `${detail.slice(0, maxLength - 1)}…`;
+}
+
+function formatHttpRequestContext(req: RequestUrlParam & RequestParam): string {
+	let path: string;
+	try {
+		path = new URL(req.url).pathname;
+	} catch {
+		path = req.url.split(/[?#]/, 1)[0];
+	}
+	path = path
+		.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "{id}")
+		.replace(/[0-9a-f]{40,64}/gi, "{object}");
+	return `${req.method ?? "GET"} ${path}`;
 }
 
 export class RepositoryUnavailableError extends Error {
@@ -177,6 +233,7 @@ export default class Server {
 	private static readonly REQUEST_TIMEOUT_MS = 120 * 1000;
 	private static readonly FS_PACK_YIELD_INTERVAL = 25;
 	public crypto: RepoCrypto | null = null;
+	private readonly libraryRevisionCache = new Map<string, LibraryRevision>();
 
 	public constructor (private readonly settings: SeafileSettings,
     private readonly plugin: SeafilePlugin
@@ -198,6 +255,10 @@ export default class Server {
 		{
 			// Intentional opt-in alternative to requestUrl, gated by settings.useFetch.
 			const controller = new AbortController();
+			const headers = { ...(req.headers ?? {}) };
+			if (req.contentType && !Object.keys(headers).some(name => name.toLowerCase() === "content-type")) {
+				headers["Content-Type"] = req.contentType;
+			}
 			const withTimeout = async <T>(task: () => Promise<T>): Promise<T> => {
 				const timeoutId = window.setTimeout(() => controller.abort(), Server.REQUEST_TIMEOUT_MS);
 				try {
@@ -213,7 +274,7 @@ export default class Server {
 			};
 			const response = await withTimeout(async () => await window.fetch(req.url, {
 				method: req.method,
-				headers: req.headers,
+				headers,
 				body: req.body,
 				signal: controller.signal,
 			}));
@@ -251,7 +312,7 @@ export default class Server {
 		}
 
 		if (!status.startsWith("2")) {
-			throw new HttpError(resp.status, ret);
+			throw new HttpError(resp.status, ret, formatHttpRequestContext(req));
 		}
 		if (ret && typeof ret === "object" && "error_msg" in ret && typeof ret.error_msg === "string") {
 			throw new Error(ret.error_msg);
@@ -562,7 +623,12 @@ export default class Server {
 				tags: Array.isArray(item.tags) ? item.tags.filter((tag): tag is string => typeof tag === "string") : []
 			}];
 		});
+		for (const revision of revisions) this.libraryRevisionCache.set(revision.commitId, revision);
 		return { revisions, more: response.more === true };
+	}
+
+	getCachedLibraryRevision(commitId: string): LibraryRevision | undefined {
+		return this.libraryRevisionCache.get(commitId);
 	}
 
 	async getSnapshotDirectory(commitId: string, remotePath = "/"): Promise<SnapshotEntry[]> {
@@ -613,21 +679,76 @@ export default class Server {
 	async restoreDeletedEntries(entries: Array<{ commitId: string, path: string }>): Promise<{ success: string[], failed: Array<{ path: string, error: string }> }> {
 		const grouped: Record<string, string[]> = {};
 		for (const entry of entries) (grouped[entry.commitId] ??= []).push(entry.path);
-		const response = await this.requestAPIv21({
-			url: `repos/${this.settings.repoId}/trash2/revert/`,
-			method: "POST",
-			body: JSON.stringify(grouped),
-			contentType: "application/json"
-		}) as {
-			success?: Array<{ path?: unknown }>,
-			failed?: Array<{ path?: unknown, error_msg?: unknown }>
-		};
-		return {
-			success: (response.success ?? []).flatMap(item => typeof item.path === "string" ? [item.path] : []),
-			failed: (response.failed ?? []).flatMap(item => typeof item.path === "string"
-				? [{ path: item.path, error: typeof item.error_msg === "string" ? item.error_msg : "Restore failed" }]
-				: [])
-		};
+		try {
+			const response = await this.requestAPIv21({
+				url: `repos/${this.settings.repoId}/trash2/revert/`,
+				method: "POST",
+				body: JSON.stringify(grouped),
+				contentType: "application/json"
+			});
+			return this.parseDeletedRestoreResponse(response);
+		} catch (error) {
+			if (!this.isMissingTrash2RestoreEndpoint(error)) throw error;
+			utils.debug.warn("[Seafile Improved] Modern trash restore endpoint is unavailable; using the compatibility endpoint.", {
+				status: error.status,
+				request: error.requestContext
+			});
+			return await this.restoreDeletedEntriesCompatibility(grouped);
+		}
+	}
+
+	private isMissingTrash2RestoreEndpoint(error: unknown): error is HttpError {
+		if (!(error instanceof HttpError) || ![404, 405].includes(error.status)) return false;
+		if (error.status === 405) return true;
+		return typeof error.response === "string" && /<(?:!doctype\s+html|html|body)(?:\s|>)/i.test(error.response);
+	}
+
+	private async restoreDeletedEntriesCompatibility(grouped: Record<string, string[]>): Promise<{ success: string[], failed: Array<{ path: string, error: string }> }> {
+		const result: { success: string[], failed: Array<{ path: string, error: string }> } = { success: [], failed: [] };
+		for (const [commitId, paths] of Object.entries(grouped)) {
+			const body = new URLSearchParams();
+			for (const path of paths) body.append("path", path);
+			body.append("commit_id", commitId);
+			try {
+				const response = await this.requestAPIv21({
+					url: `repos/${this.settings.repoId}/trash/revert-dirents/`,
+					method: "POST",
+					body: body.toString(),
+					contentType: "application/x-www-form-urlencoded"
+				});
+				const restored = this.parseDeletedRestoreResponse(response);
+				result.success.push(...restored.success);
+				result.failed.push(...restored.failed);
+			} catch (error) {
+				utils.debug.error("[Seafile Improved] Deleted-item compatibility restore failed.", {
+					commitId,
+					paths,
+					error
+				});
+				const message = error instanceof Error ? error.message : String(error);
+				result.failed.push(...paths.map(path => ({ path, error: message })));
+			}
+		}
+		return result;
+	}
+
+	private parseDeletedRestoreResponse(response: unknown): { success: string[], failed: Array<{ path: string, error: string }> } {
+		const payload = isUnknownRecord(response) ? response : {};
+		const successItems = isUnknownArray(payload.success) ? payload.success : [];
+		const failedItems = isUnknownArray(payload.failed) ? payload.failed : [];
+		const success: string[] = [];
+		const failed: Array<{ path: string, error: string }> = [];
+		for (const item of successItems) {
+			if (isUnknownRecord(item) && typeof item.path === "string") success.push(item.path);
+		}
+		for (const item of failedItems) {
+			if (!isUnknownRecord(item) || typeof item.path !== "string") continue;
+			failed.push({
+				path: item.path,
+				error: typeof item.error_msg === "string" ? item.error_msg : "Restore failed"
+			});
+		}
+		return { success, failed };
 	}
 
 	async renameFile (oldPath: string, newName: string) {

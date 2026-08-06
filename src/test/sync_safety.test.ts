@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, jest, test } from "@jest/globals";
 import { rm } from "fs/promises";
-import { DOWNLOAD_JOURNAL_PATH, initConfig, SYNC_DLOG_PATH } from "../config";
+import { DOWNLOAD_JOURNAL_PATH, DOWNLOAD_STAGING_PATH, initConfig, SYNC_DLOG_PATH } from "../config";
 import { MODE_DIR, MODE_FILE, TYPE_FILE, type DirSeafDirent, type FileSeafDirent, type FileSeafFs } from "../server";
 import { SyncController, type NodeChange } from "../sync/controller";
 import { SyncNode } from "../sync/node";
@@ -85,6 +85,23 @@ describe("sync data safety", () => {
 		expect(progress).toEqual([0, 3, 6]);
 	});
 
+	test("keeps replacement staging inside the private plugin directory", async () => {
+		const sync = setupServer(
+			{ block_ids: ["only"], size: 3, type: TYPE_FILE, version: 1 },
+			{ only: new TextEncoder().encode("new").buffer }
+		);
+		const adapter = global.app.vault.adapter;
+		await adapter.write(originalPath, "original");
+		const write = jest.spyOn(adapter, "write");
+		const rename = jest.spyOn(adapter, "rename");
+
+		await sync.downloadFile(originalPath, "fs-id", 1700000000, 3);
+
+		expect(write.mock.calls.some(([path]) => path.startsWith(`${DOWNLOAD_STAGING_PATH}/`))).toBe(true);
+		expect(rename).toHaveBeenCalledWith(originalPath, expect.stringMatching(new RegExp(`^${DOWNLOAD_STAGING_PATH}/.+\\.backup$`)));
+		expect(rename.mock.calls.some(([from, to]) => from.startsWith(`${DOWNLOAD_STAGING_PATH}/`) && to === originalPath)).toBe(true);
+	});
+
 	test("prefetches desktop blocks concurrently and appends them in order", async () => {
 		const blockIds = ["first", "second", "third", "fourth", "fifth"];
 		const fs: FileSeafFs = { block_ids: blockIds, size: blockIds.length, type: TYPE_FILE, version: 1 };
@@ -124,6 +141,27 @@ describe("sync data safety", () => {
 		expect(await adapter.exists(`.${originalPath}.seafile-backup`)).toBe(false);
 	});
 
+	test("retains the private recovery journal when immediate rollback also fails", async () => {
+		const sync = setupServer({ block_ids: ["only"], size: 3, type: TYPE_FILE, version: 1 }, { only: new TextEncoder().encode("new").buffer });
+		const adapter = global.app.vault.adapter;
+		await adapter.write(originalPath, "original");
+		const realRename = adapter.rename.bind(adapter);
+		const rename = jest.spyOn(adapter, "rename");
+		rename.mockImplementation(async (from, to) => {
+			if (from.startsWith(`${DOWNLOAD_STAGING_PATH}/`) && to === originalPath) throw new Error("rename failed");
+			await realRename(from, to);
+		});
+
+		await expect(sync.downloadFile(originalPath, "fs-id", 1700000000, 3)).rejects.toThrow("rename failed");
+		const staged = await adapter.list(DOWNLOAD_STAGING_PATH);
+		expect(staged.files.some(path => path.endsWith(".json"))).toBe(true);
+		expect(staged.files.some(path => path.endsWith(".backup"))).toBe(true);
+
+		rename.mockRestore();
+		await sync.init();
+		expect(await adapter.read(originalPath)).toBe("original");
+	});
+
 	test("restores an original file from an interrupted replacement backup at startup", async () => {
 		const fs: FileSeafFs = { block_ids: [], size: 0, type: TYPE_FILE, version: 1 };
 		const sync = setupServer(fs, {});
@@ -140,6 +178,25 @@ describe("sync data safety", () => {
 		expect(await global.app.vault.adapter.read(originalPath)).toBe("recover me");
 		expect(await global.app.vault.adapter.exists(`.${originalPath}.seafile-backup`)).toBe(false);
 		expect(await global.app.vault.adapter.exists(`.${originalPath}.seafile-download`)).toBe(false);
+	});
+
+	test("recovers every private per-download journal independently", async () => {
+		const sync = setupServer({ block_ids: [], size: 0, type: TYPE_FILE, version: 1 }, {});
+		const adapter = global.app.vault.adapter;
+		await adapter.mkdir(DOWNLOAD_STAGING_PATH);
+		for (const [id, path, contents] of [["one", "first.md", "first"], ["two", "second.md", "second"]] as const) {
+			const tempPath = `${DOWNLOAD_STAGING_PATH}/${id}.download`;
+			const backupPath = `${DOWNLOAD_STAGING_PATH}/${id}.backup`;
+			await adapter.write(tempPath, "partial");
+			await adapter.write(backupPath, contents);
+			await adapter.write(`${DOWNLOAD_STAGING_PATH}/${id}.json`, JSON.stringify({ path, tempPath, backupPath }));
+		}
+
+		await sync.init();
+
+		expect(await adapter.read("first.md")).toBe("first");
+		expect(await adapter.read("second.md")).toBe("second");
+		expect(await adapter.exists(DOWNLOAD_STAGING_PATH)).toBe(false);
 	});
 
 	test("persists and notifies a batch of applied nodes once", async () => {

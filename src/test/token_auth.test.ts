@@ -35,7 +35,9 @@ describe("manual API token authentication", () => {
 			{ status: 401, headers: { "Content-Type": "application/json" } }
 		));
 
-		await expect(makeServer().validateAuthToken("invalid-token")).rejects.toThrow("HTTP 401");
+		await expect(makeServer().validateAuthToken("invalid-token")).rejects.toThrow(
+			"HTTP 401 during GET /api/v2.1/repos/: Invalid token"
+		);
 	});
 
 	test("rejects an empty token without making a request", async () => {
@@ -82,6 +84,28 @@ describe("manual API token authentication", () => {
 
 		await client.checkNotificationServer("https://example.test/notification/");
 		expect(fetchMock.mock.calls[0][0]).toBe("https://example.test/notification/ping");
+	});
+
+	test("forwards request content types through the optional fetch transport", async () => {
+		Object.defineProperty(globalThis, "window", { configurable: true, value: globalThis });
+		const fetchMock = jest.spyOn(global, "fetch").mockResolvedValue(new Response("{}", {
+			status: 200,
+			headers: { "Content-Type": "application/json" }
+		}));
+		const client = new Server(
+			{ ...DEFAULT_SETTINGS, host: "https://example.test", repoId: "repo", authToken: "token", useFetch: true },
+			{ manifest: { version: "test" } } as never
+		);
+
+		try {
+			await client.renameFile("/old.md", "new.md");
+			expect(fetchMock.mock.calls[0][1]?.headers).toEqual({
+				Authorization: "Token token",
+				"Content-Type": "application/x-www-form-urlencoded"
+			});
+		} finally {
+			delete (globalThis as { window?: unknown }).window;
+		}
 	});
 
 	test("rejects a downloaded block whose content does not match its ID", async () => {

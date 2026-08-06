@@ -8,6 +8,9 @@ export interface FileRevision {
 	size: number
 	fileId: string
 	renamedFrom?: string
+	deleted?: boolean
+	contentChanged?: boolean
+	metadataChanges?: FileMetadataChange[]
 }
 
 export interface LibraryRevision {
@@ -59,9 +62,34 @@ export interface HistoryGroup {
 export interface SnapshotDiff {
 	addedFiles: string[]
 	modifiedFiles: string[]
+	modifiedFileChanges: SnapshotFileChange[]
 	deletedFiles: string[]
 	addedDirectories: string[]
 	deletedDirectories: string[]
+}
+
+export type SnapshotFileChangeKind = "added" | "modified" | "deleted";
+
+export type FileMetadataField = "mtime" | "modifier" | "size";
+
+export interface FileMetadataChange {
+	field: FileMetadataField
+	before: string | number
+	after: string | number
+}
+
+export interface SnapshotFileChange {
+	path: string
+	kind: SnapshotFileChangeKind
+	contentChanged?: boolean
+	metadataChanges?: FileMetadataChange[]
+}
+
+export interface CommitSnapshotChanges {
+	commitId: string
+	parentCommitId: string | null
+	diff: SnapshotDiff
+	files: SnapshotFileChange[]
 }
 
 export interface LocalCheckpoint {

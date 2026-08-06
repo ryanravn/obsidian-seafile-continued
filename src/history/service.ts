@@ -1,6 +1,15 @@
 import { posix as Path } from "path-browserify";
-import Server, { MODE_DIR, MODE_FILE, TYPE_DIR, TYPE_FILE, ZeroFs, type DirSeafFs, type FileSeafDirent, type SeafDirent } from "../server";
-import type { FileRevision, SnapshotDiff } from "./types";
+import Server, { MODE_DIR, MODE_FILE, TYPE_DIR, TYPE_FILE, ZeroFs, type Commit, type DirSeafFs, type FileSeafDirent, type SeafDirent } from "../server";
+import { createLineDiffResult, type DiffLine } from "./text_diff";
+import { formatHistoryText, historyTextDiffLimit, historyTextKind, isLikelyTextContent } from "./text_format";
+import type { CommitSnapshotChanges, FileMetadataChange, FileRevision, LibraryRevision, SnapshotDiff, SnapshotFileChangeKind } from "./types";
+
+export interface HistoricalTextDiff {
+	lines: DiffLine[]
+	additions: number | null
+	deletions: number | null
+	truncated: boolean
+}
 
 export interface HistoricalFile {
 	path: string
@@ -10,6 +19,20 @@ export interface HistoricalFile {
 	mtime: number
 	content: ArrayBuffer
 }
+
+export interface DeletedFileHistoryPage {
+	revisions: FileRevision[]
+	nextCommit: string | null
+	skipNewestVersion: boolean
+	scannedCommits: number
+}
+
+export interface FileMetadataRevisionScan {
+	revision: FileRevision | null
+	creationBoundary: boolean
+}
+
+const DELETED_HISTORY_SCAN_LIMIT = 50;
 
 export class HistoryService {
 	constructor(private readonly server: Server) {}
@@ -24,7 +47,12 @@ export class HistoryService {
 
 	async readRevision(revision: FileRevision): Promise<HistoricalFile> {
 		const path = this.normalizePath(revision.renamedFrom || revision.path);
-		if (!revision.fileId) return await this.readFile(revision.commitId, path);
+		if (!revision.fileId) {
+			const commitId = revision.deleted
+				? (await this.server.getCommitInfo(revision.commitId)).parent_id
+				: revision.commitId;
+			return await this.readFile(commitId, path);
+		}
 		const file: FileSeafDirent = {
 			id: revision.fileId,
 			mode: MODE_FILE,
@@ -43,22 +71,220 @@ export class HistoryService {
 		};
 	}
 
+	async getDeletedRevision(commitId: string, rawPath: string): Promise<FileRevision> {
+		const path = this.normalizePath(rawPath);
+		const commit = await this.server.getCommitInfo(commitId);
+		if (!commit.parent_id) throw new Error("The deletion commit has no parent snapshot.");
+		const entry = await this.resolvePath(commit.parent_id, path);
+		if (!entry || entry.mode !== MODE_FILE) {
+			throw new Error(`The deleted file '${path}' is unavailable in the deletion commit's parent snapshot.`);
+		}
+		return this.deletedRevision(commit, entry, path);
+	}
+
+	async findRetainedDeletedRevision(rawPath: string, limit = 200): Promise<FileRevision | null> {
+		const path = this.normalizePath(rawPath);
+		let cursor = await this.server.getHeadCommitId();
+		let missingCommit: Commit | null = null;
+		let scanned = 0;
+		while (cursor && scanned++ < limit) {
+			const commit = await this.server.getCommitInfo(cursor);
+			const entry = await this.resolvePath(cursor, path);
+			if (entry?.mode === MODE_FILE) {
+				return missingCommit ? this.deletedRevision(missingCommit, entry, path) : null;
+			}
+			missingCommit = commit;
+			cursor = commit.parent_id;
+		}
+		return null;
+	}
+
+	async scanFileMetadataRevision(
+		revision: Pick<LibraryRevision, "commitId" | "createdAt" | "authorName" | "authorEmail" | "description">,
+		rawPath: string,
+		parentRawPath = rawPath
+	): Promise<FileMetadataRevisionScan> {
+		const path = this.normalizePath(rawPath);
+		const parentPath = this.normalizePath(parentRawPath);
+		const commit = await this.server.getCommitInfo(revision.commitId);
+		const [beforeEntry, afterEntry] = await Promise.all([
+			commit.parent_id ? this.resolvePath(commit.parent_id, parentPath) : Promise.resolve(null),
+			this.resolvePath(revision.commitId, path)
+		]);
+		const before = beforeEntry?.mode === MODE_FILE ? beforeEntry : null;
+		const after = afterEntry?.mode === MODE_FILE ? afterEntry : null;
+		if (!before && after) return { revision: null, creationBoundary: true };
+		if (!before || !after || before.id !== after.id) return { revision: null, creationBoundary: false };
+		const metadataChanges = this.fileMetadataChanges(before, after);
+		if (metadataChanges.length === 0) return { revision: null, creationBoundary: false };
+		return { creationBoundary: false, revision: {
+			commitId: revision.commitId,
+			path,
+			createdAt: revision.createdAt,
+			authorName: revision.authorName,
+			authorEmail: revision.authorEmail,
+			description: revision.description,
+			size: after.size,
+			fileId: after.id,
+			contentChanged: false,
+			metadataChanges
+		} };
+	}
+
+	async getDeletedFileHistory(
+		deletedRevision: FileRevision,
+		startCommit?: string,
+		skipNewestVersion = true,
+		limit = 50
+	): Promise<DeletedFileHistoryPage> {
+		const path = this.normalizePath(deletedRevision.renamedFrom || deletedRevision.path);
+		let cursor = startCommit || (await this.server.getCommitInfo(deletedRevision.commitId)).parent_id;
+		let candidate: { commit: Commit, file: FileSeafDirent } | null = null;
+		const revisions: FileRevision[] = [];
+		let scanned = 0;
+
+		while (cursor && scanned < DELETED_HISTORY_SCAN_LIMIT) {
+			const commit = await this.server.getCommitInfo(cursor);
+			const entry = await this.resolvePath(cursor, path);
+			scanned++;
+
+			if (!entry || entry.mode !== MODE_FILE) {
+				if (candidate) {
+					if (skipNewestVersion) skipNewestVersion = false;
+					else revisions.push(this.fileRevision(candidate.commit, candidate.file, path));
+				}
+				return { revisions, nextCommit: null, skipNewestVersion, scannedCommits: scanned };
+			}
+
+			if (!candidate || candidate.file.id === entry.id) {
+				candidate = { commit, file: entry };
+				cursor = commit.parent_id;
+				continue;
+			}
+
+			if (skipNewestVersion) skipNewestVersion = false;
+			else revisions.push(this.fileRevision(candidate.commit, candidate.file, path));
+			if (revisions.length >= limit) {
+				return { revisions, nextCommit: cursor, skipNewestVersion, scannedCommits: scanned };
+			}
+			candidate = { commit, file: entry };
+			cursor = commit.parent_id;
+		}
+
+		if (!cursor) {
+			if (candidate) {
+				if (skipNewestVersion) skipNewestVersion = false;
+				else revisions.push(this.fileRevision(candidate.commit, candidate.file, path));
+			}
+			return { revisions, nextCommit: null, skipNewestVersion, scannedCommits: scanned };
+		}
+
+		return {
+			revisions,
+			nextCommit: candidate?.commit.commit_id ?? cursor,
+			skipNewestVersion,
+			scannedCommits: scanned
+		};
+	}
+
 	async compareSnapshots(currentCommitId: string, targetCommitId: string): Promise<SnapshotDiff> {
 		const [currentRoot, targetRoot] = await Promise.all([
 			this.server.getCommitRoot(currentCommitId),
 			this.server.getCommitRoot(targetCommitId)
 		]);
 		const diff: SnapshotDiff = {
-			addedFiles: [], modifiedFiles: [], deletedFiles: [], addedDirectories: [], deletedDirectories: []
+			addedFiles: [], modifiedFiles: [], modifiedFileChanges: [], deletedFiles: [], addedDirectories: [], deletedDirectories: []
 		};
 		await this.compareDirectory("", currentRoot.id, targetRoot.id, diff);
 		return diff;
+	}
+
+	async compareCommitToParent(commitId: string): Promise<CommitSnapshotChanges> {
+		const commit = await this.server.getCommitInfo(commitId);
+		const parentCommitId = commit.parent_id || null;
+		const [parentRoot, commitRoot] = await Promise.all([
+			parentCommitId ? this.server.getCommitRoot(parentCommitId) : Promise.resolve(null),
+			this.server.getCommitRoot(commitId)
+		]);
+		const diff: SnapshotDiff = {
+			addedFiles: [], modifiedFiles: [], modifiedFileChanges: [], deletedFiles: [], addedDirectories: [], deletedDirectories: []
+		};
+		await this.compareDirectory("", parentRoot?.id ?? null, commitRoot.id, diff);
+		return {
+			commitId,
+			parentCommitId,
+			diff,
+			files: [
+				...diff.addedFiles.map(path => ({ path, kind: "added" as const })),
+				...diff.modifiedFileChanges,
+				...diff.deletedFiles.map(path => ({ path, kind: "deleted" as const }))
+			].sort((left, right) => left.path.localeCompare(right.path))
+		};
+	}
+
+	async compareTextFile(
+		parentCommitId: string | null,
+		commitId: string,
+		path: string,
+		kind: SnapshotFileChangeKind
+	): Promise<HistoricalTextDiff | null> {
+		const maxBytes = historyTextDiffLimit(path);
+		if (maxBytes === null) return null;
+		const [beforeEntry, afterEntry] = await Promise.all([
+			parentCommitId && kind !== "added" ? this.resolvePath(parentCommitId, this.normalizePath(path)) : Promise.resolve(null),
+			kind !== "deleted" ? this.resolvePath(commitId, this.normalizePath(path)) : Promise.resolve(null)
+		]);
+		const before = beforeEntry?.mode === MODE_FILE ? beforeEntry : null;
+		const after = afterEntry?.mode === MODE_FILE ? afterEntry : null;
+		if ((!before && !after) || Math.max(before?.size ?? 0, after?.size ?? 0) > maxBytes) return null;
+		const [beforeContent, afterContent] = await Promise.all([
+			before ? this.readFileObject(before) : Promise.resolve(new ArrayBuffer(0)),
+			after ? this.readFileObject(after) : Promise.resolve(new ArrayBuffer(0))
+		]);
+		if (historyTextKind(path) === null && (
+			(before !== null && !isLikelyTextContent(beforeContent))
+			|| (after !== null && !isLikelyTextContent(afterContent))
+		)) return null;
+		const result = createLineDiffResult(
+			formatHistoryText(path, new TextDecoder().decode(beforeContent)),
+			formatHistoryText(path, new TextDecoder().decode(afterContent))
+		);
+		return result;
 	}
 
 	private normalizePath(rawPath: string): string {
 		if (rawPath.split("/").includes("..")) throw new Error("Historical path is invalid.");
 		const normalized = Path.normalize("/" + rawPath.replace(/^\/+/, ""));
 		return normalized;
+	}
+
+	private fileRevision(commit: Commit, file: FileSeafDirent, path: string): FileRevision {
+		const metadata = this.server.getCachedLibraryRevision?.(commit.commit_id);
+		return {
+			commitId: commit.commit_id,
+			path,
+			createdAt: metadata?.createdAt ?? file.mtime * 1000,
+			authorName: metadata?.authorName || commit.creator_name,
+			authorEmail: metadata?.authorEmail || commit.creator,
+			description: metadata?.description || commit.description,
+			size: file.size,
+			fileId: file.id
+		};
+	}
+
+	private deletedRevision(commit: Commit, file: FileSeafDirent, path: string): FileRevision {
+		const metadata = this.server.getCachedLibraryRevision?.(commit.commit_id);
+		return {
+			commitId: commit.commit_id,
+			path,
+			createdAt: metadata?.createdAt ?? commit.ctime * 1000,
+			authorName: metadata?.authorName || commit.creator_name,
+			authorEmail: metadata?.authorEmail || commit.creator,
+			description: metadata?.description || commit.description,
+			size: file.size,
+			fileId: file.id,
+			deleted: true
+		};
 	}
 
 	private async resolvePath(commitId: string, path: string): Promise<SeafDirent | null> {
@@ -128,10 +354,23 @@ export class HistoryService {
 				await this.collectAdded(childPath, after, diff);
 			} else if (before?.mode === MODE_DIR && after?.mode === MODE_DIR) {
 				await this.compareDirectory(childPath, before.id, after.id, diff);
-			} else if (before?.mode === MODE_FILE && after?.mode === MODE_FILE && before.id !== after.id) {
-				diff.modifiedFiles.push(childPath);
+			} else if (before?.mode === MODE_FILE && after?.mode === MODE_FILE) {
+				const metadataChanges = this.fileMetadataChanges(before, after);
+				const contentChanged = before.id !== after.id;
+				if (contentChanged || metadataChanges.length > 0) {
+					diff.modifiedFiles.push(childPath);
+					diff.modifiedFileChanges.push({ path: childPath, kind: "modified", contentChanged, metadataChanges });
+				}
 			}
 		}
+	}
+
+	private fileMetadataChanges(before: FileSeafDirent, after: FileSeafDirent): FileMetadataChange[] {
+		const changes: FileMetadataChange[] = [];
+		if (before.mtime !== after.mtime) changes.push({ field: "mtime", before: before.mtime, after: after.mtime });
+		if (before.modifier !== after.modifier) changes.push({ field: "modifier", before: before.modifier, after: after.modifier });
+		if (before.size !== after.size) changes.push({ field: "size", before: before.size, after: after.size });
+		return changes;
 	}
 
 	private async collectAdded(path: string, entry: SeafDirent, diff: SnapshotDiff): Promise<void> {

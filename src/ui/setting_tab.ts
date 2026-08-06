@@ -550,7 +550,7 @@ export class SeafileSettingTab extends PluginSettingTab {
 				desc: "Forget only the local Seafile baseline and safely merge the existing vault with the remote library again. Vault files are preserved.",
 				aliases: ["resync", "repair sync data", "reset index"],
 				render: setting => {
-					setting.addButton(button => button.setButtonText("Rebuild").setWarning().onClick(() => {
+					setting.addButton(button => button.setButtonText("Rebuild").setDestructive().onClick(() => {
 						new Dialog(this.app,
 							"Rebuild sync index",
 							"This removes only the plugin's local synchronization index. Vault files remain in place. The next sync performs a fresh merge and may create conflict copies where local and remote files differ. Continue?",

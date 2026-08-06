@@ -7,6 +7,7 @@ function setup(existing?: string): Map<string, string> {
 	if (existing !== undefined) files.set(path, existing);
 	const adapter = {
 		exists: async (candidate: string) => files.has(candidate),
+		read: async (candidate: string) => files.get(candidate)!,
 		write: async (candidate: string, contents: string) => { files.set(candidate, contents); }
 	};
 	initConfig({ vault: { configDir: ".obsidian", adapter } } as never, {} as never, "seafile-improved");
@@ -20,15 +21,15 @@ describe("plugin runtime-data gitignore", () => {
 		await ensurePluginGitignore();
 
 		expect(PLUGIN_GITIGNORE_PATH).toBe(".obsidian/plugins/seafile-improved/.gitignore");
-		expect(files.get(PLUGIN_GITIGNORE_PATH)).toBe("head_commit\nsync_data\nsync_dlog\n");
+		expect(files.get(PLUGIN_GITIGNORE_PATH)).toBe("head_commit\nsync_data\nsync_dlog\ndownload_staging\n");
 		expect(files.get(PLUGIN_GITIGNORE_PATH)).toBe(PLUGIN_GITIGNORE_CONTENT);
 	});
 
-	test("does not overwrite an existing user-maintained file", async () => {
+	test("preserves existing entries while adding required runtime paths", async () => {
 		const files = setup("custom-entry\n");
 
 		await ensurePluginGitignore();
 
-		expect(files.get(PLUGIN_GITIGNORE_PATH)).toBe("custom-entry\n");
+		expect(files.get(PLUGIN_GITIGNORE_PATH)).toBe("custom-entry\nhead_commit\nsync_data\nsync_dlog\ndownload_staging\n");
 	});
 });

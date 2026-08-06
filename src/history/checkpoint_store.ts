@@ -70,12 +70,24 @@ export class LocalCheckpointStore {
 
 	async list(path?: string): Promise<LocalCheckpoint[]> {
 		await this.ensureLoaded();
+		await this.removeMissingObjectReferences(path);
 		return this.index!.checkpoints.filter(checkpoint => path === undefined || checkpoint.path === path).map(checkpoint => ({ ...checkpoint }));
 	}
 
 	async read(checkpoint: LocalCheckpoint): Promise<ArrayBuffer> {
 		if (!/^[a-f0-9]{64}$/i.test(checkpoint.objectId)) throw new Error("Local checkpoint object identifier is invalid.");
-		return await this.adapter.readBinary(`${this.objectsRoot}/${checkpoint.objectId}`);
+		const objectPath = `${this.objectsRoot}/${checkpoint.objectId}`;
+		if (!await this.adapter.exists(objectPath)) {
+			await this.removeObjectReferences(checkpoint.objectId);
+			throw new Error("Local checkpoint content is no longer available. Its stale history entry was removed.");
+		}
+		try {
+			return await this.adapter.readBinary(objectPath);
+		} catch (error) {
+			if (await this.adapter.exists(objectPath)) throw error;
+			await this.removeObjectReferences(checkpoint.objectId);
+			throw new Error("Local checkpoint content is no longer available. Its stale history entry was removed.");
+		}
 	}
 
 	async markPublished(checkpointId: string, commitId: string): Promise<void> {
@@ -94,6 +106,7 @@ export class LocalCheckpointStore {
 
 	async getStorageBytes(): Promise<number> {
 		await this.ensureLoaded();
+		await this.removeMissingObjectReferences();
 		const unique = new Map<string, number>();
 		for (const checkpoint of this.index!.checkpoints) unique.set(checkpoint.objectId, checkpoint.size);
 		return Array.from(unique.values()).reduce((total, size) => total + size, 0);
@@ -139,6 +152,26 @@ export class LocalCheckpointStore {
 	private async saveIndex(): Promise<void> {
 		await this.ensureDirectories();
 		await this.adapter.write(this.indexPath, JSON.stringify(this.index));
+	}
+
+	private async removeMissingObjectReferences(path?: string): Promise<void> {
+		const objectIds = new Set(this.index!.checkpoints
+			.filter(checkpoint => path === undefined || checkpoint.path === path)
+			.map(checkpoint => checkpoint.objectId));
+		const missing = new Set<string>();
+		for (const objectId of objectIds) {
+			if (!await this.adapter.exists(`${this.objectsRoot}/${objectId}`)) missing.add(objectId);
+		}
+		if (missing.size === 0) return;
+		this.index!.checkpoints = this.index!.checkpoints.filter(checkpoint => !missing.has(checkpoint.objectId));
+		await this.saveIndex();
+	}
+
+	private async removeObjectReferences(objectId: string): Promise<void> {
+		await this.ensureLoaded();
+		const length = this.index!.checkpoints.length;
+		this.index!.checkpoints = this.index!.checkpoints.filter(checkpoint => checkpoint.objectId !== objectId);
+		if (this.index!.checkpoints.length !== length) await this.saveIndex();
 	}
 
 	private async prune(): Promise<void> {

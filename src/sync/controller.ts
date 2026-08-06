@@ -1,7 +1,7 @@
 import { posix as Path } from "path-browserify";
 import { FileSystemAdapter, Notice, Platform, type DataAdapter, type Stat } from "obsidian";
 import { type SeafileSettings } from "src/settings";
-import { DEFAULT_SEAFILE_IGNORE, DOWNLOAD_JOURNAL_PATH, HEAD_COMMIT_PATH, PLUGIN_DIR, SYNC_DATA_PATH, SYNC_DLOG_PATH, server } from "../config";
+import { DEFAULT_SEAFILE_IGNORE, DOWNLOAD_JOURNAL_PATH, DOWNLOAD_STAGING_PATH, HEAD_COMMIT_PATH, PLUGIN_DIR, SYNC_DATA_PATH, SYNC_DLOG_PATH, server } from "../config";
 import { MODE_DIR, MODE_FILE, RepositoryUnavailableError, TYPE_FILE, ZeroFs, type DirSeafDirent, type DirSeafFs, type FileSeafDirent, type SeafDirent, type SeafFs } from "../server";
 import * as utils from "../utils";
 import { debug } from "../utils";
@@ -107,6 +107,12 @@ interface FileUpload {
   node: SyncNode
   state: STATE_UPLOAD
   blockIds: string[]
+}
+
+interface DownloadJournal {
+	path: string
+	tempPath: string
+	backupPath: string
 }
 
 interface DesktopFileHandle {
@@ -544,6 +550,7 @@ export class SyncController {
 		for (const path of [SYNC_DLOG_PATH, SYNC_DATA_PATH, HEAD_COMMIT_PATH, DOWNLOAD_JOURNAL_PATH]) {
 			if (await this.adapter.exists(path)) await this.adapter.remove(path);
 		}
+		if (await this.adapter.exists(DOWNLOAD_STAGING_PATH)) await this.adapter.rmdir(DOWNLOAD_STAGING_PATH, true);
 
 		this.localHead = undefined;
 		this.ignoreFileBootstrapped = false;
@@ -556,9 +563,25 @@ export class SyncController {
 	}
 
 	private async recoverInterruptedDownload(): Promise<void> {
-		let journal: { path: string, tempPath: string, backupPath: string };
+		await this.recoverDownloadJournal(DOWNLOAD_JOURNAL_PATH);
+		if (!await this.adapter.exists(DOWNLOAD_STAGING_PATH)) return;
+
+		const staged = await this.adapter.list(DOWNLOAD_STAGING_PATH);
+		for (const journalPath of staged.files.filter(path => path.endsWith(".json"))) {
+			await this.recoverDownloadJournal(journalPath);
+		}
+
+		const remaining = await this.adapter.list(DOWNLOAD_STAGING_PATH);
+		if (remaining.files.length === 0 && remaining.folders.length === 0) {
+			await this.adapter.rmdir(DOWNLOAD_STAGING_PATH, true);
+		}
+	}
+
+	private async recoverDownloadJournal(journalPath: string): Promise<void> {
+		if (!await this.adapter.exists(journalPath)) return;
+		let journal: DownloadJournal;
 		try {
-			journal = JSON.parse(await this.adapter.read(DOWNLOAD_JOURNAL_PATH)) as typeof journal;
+			journal = JSON.parse(await this.adapter.read(journalPath)) as DownloadJournal;
 			if (!journal.path || !journal.tempPath || !journal.backupPath) return;
 		} catch {
 			return;
@@ -572,18 +595,25 @@ export class SyncController {
 				await this.adapter.rename(journal.backupPath, journal.path);
 			}
 		}
-		await this.adapter.write(DOWNLOAD_JOURNAL_PATH, "");
+		await this.adapter.remove(journalPath);
 		this.onIssue?.({ kind: "recovery", message: "Recovered a file after an interrupted download.", path: this.normalizePath(journal.path) });
 	}
 
-	private async unusedSiblingPath(path: string, marker: string): Promise<string> {
-		const parent = Path.dirname(path);
-		const name = Path.basename(path);
-		for (let suffix = 0; ; suffix++) {
-			const candidateName = `.${name}.${marker}${suffix ? `-${suffix}` : ""}`;
-			const candidate = Path.join(parent, candidateName);
-			if (!await this.adapter.exists(candidate)) return candidate;
+	private async createDownloadStagingPaths(path: string): Promise<DownloadJournal & { journalPath: string }> {
+		if (!await this.adapter.exists(DOWNLOAD_STAGING_PATH)) {
+			try {
+				await this.adapter.mkdir(DOWNLOAD_STAGING_PATH);
+			} catch (error) {
+				if (!await this.adapter.exists(DOWNLOAD_STAGING_PATH)) throw error;
+			}
 		}
+		const id = crypto.randomUUID();
+		return {
+			path,
+			tempPath: `${DOWNLOAD_STAGING_PATH}/${id}.download`,
+			backupPath: `${DOWNLOAD_STAGING_PATH}/${id}.backup`,
+			journalPath: `${DOWNLOAD_STAGING_PATH}/${id}.json`
+		};
 	}
 
 	private async conflictPath(path: string): Promise<string> {
@@ -620,17 +650,15 @@ export class SyncController {
 
 	async downloadFile (path: string, fsId: string, mtime: number, expectedSize: number, onProgress?: (completedBytes: number) => void) {
 		return await this.withFileIoSlot(async () => {
-			const tempPath = await this.unusedSiblingPath(path, "seafile-download");
-			const backupPath = await this.unusedSiblingPath(path, "seafile-backup");
+			const { tempPath, backupPath, journalPath } = await this.createDownloadStagingPaths(path);
 			let originalMoved = false;
 			let replacementInstalled = false;
+			let cleanupComplete = false;
 			let completedBytes = 0;
 			this.ignoreChange.add(path);
-			this.ignoreChange.add(tempPath);
-			this.ignoreChange.add(backupPath);
 			try {
 				onProgress?.(0);
-				await this.adapter.write(DOWNLOAD_JOURNAL_PATH, JSON.stringify({ path, tempPath, backupPath }));
+				await this.adapter.write(journalPath, JSON.stringify({ path, tempPath, backupPath }));
 				mtime = mtime * 1000;
 				await this.adapter.write(tempPath, "", { mtime });
 
@@ -696,18 +724,18 @@ export class SyncController {
 				await this.adapter.append(path, "", { mtime });
 				if (originalMoved && await this.adapter.exists(backupPath)) await this.adapter.remove(backupPath);
 				originalMoved = false;
+				cleanupComplete = true;
 			} catch (error) {
 				if (await this.adapter.exists(tempPath)) await this.adapter.remove(tempPath);
 				if (replacementInstalled && await this.adapter.exists(path)) await this.adapter.remove(path);
 				if (originalMoved && await this.adapter.exists(backupPath)) {
 					if (!await this.adapter.exists(path)) await this.adapter.rename(backupPath, path);
 				}
+				cleanupComplete = true;
 				throw error;
 			} finally {
-				await this.adapter.write(DOWNLOAD_JOURNAL_PATH, "");
+				if (cleanupComplete && await this.adapter.exists(journalPath)) await this.adapter.remove(journalPath);
 				this.ignoreChange.delete(path);
-				this.ignoreChange.delete(tempPath);
-				this.ignoreChange.delete(backupPath);
 			}
 		});
 	}
