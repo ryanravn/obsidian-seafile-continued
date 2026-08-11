@@ -511,6 +511,33 @@
 	white-space: pre-wrap;
 }
 
+.conflictPath {
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+	margin: 0.1rem 0 0.6rem;
+	overflow-wrap: anywhere;
+}
+
+.conflictSummary {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	margin: 0.75rem 0 0.35rem;
+}
+
+.conflictDiff {
+	background: var(--background-secondary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	max-height: min(45vh, 30rem);
+	overflow: auto;
+	padding: 0.5rem;
+}
+
+.conflictActions {
+	border-top: 0;
+	margin-top: 0.5rem;
+}
+
 .danger {
 	color: var(--text-error);
 }

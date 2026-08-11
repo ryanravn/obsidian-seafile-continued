@@ -1,15 +1,20 @@
 import { posix as Path } from "path-browserify";
 import { FileSystemAdapter, Notice, Platform, type DataAdapter, type Stat } from "obsidian";
 import { type SeafileSettings } from "src/settings";
-import { DEFAULT_SEAFILE_IGNORE, DOWNLOAD_JOURNAL_PATH, DOWNLOAD_STAGING_PATH, HEAD_COMMIT_PATH, PLUGIN_DIR, SYNC_DATA_PATH, SYNC_DLOG_PATH, server } from "../config";
+import { app, DEFAULT_SEAFILE_IGNORE, DOWNLOAD_JOURNAL_PATH, DOWNLOAD_STAGING_PATH, HEAD_COMMIT_PATH, PLUGIN_DIR, SYNC_DATA_PATH, SYNC_DLOG_PATH, server } from "../config";
 import { MODE_DIR, MODE_FILE, RepositoryUnavailableError, TYPE_FILE, ZeroFs, type DirSeafDirent, type DirSeafFs, type FileSeafDirent, type SeafDirent, type SeafFs } from "../server";
 import * as utils from "../utils";
 import { debug } from "../utils";
-import { compileIgnoreList, SEAFILE_IGNORE_FILE, type IgnoreList } from "../ignore";
+import { compileIgnoreList, SEAFILE_IGNORE_FILE, upsertManagedIgnoreBlock, type IgnoreList } from "../ignore";
 import { SyncNode, type STATE_UPLOAD, type SyncStateChangedListener as NodeStateChangedListener } from "./node";
 import { MobileDataAdapter } from "src/@types/obsidian";
 import { findCaseCollisions, validatePathSegment, type PathPreflightIssue } from "./preflight";
 import { shouldSurfaceSyncIssue, type SyncIssueInput } from "./issues";
+import { mergeFileContents, type MergeResult } from "./merge";
+import { ObsidianSyncPolicy } from "./policy";
+import { applyLibrarySyncPolicy, createLibrarySyncPolicy, LIBRARY_POLICY_FILE, LibraryPolicyError, parseLibrarySyncPolicy, serializeLibrarySyncPolicy } from "./library_policy";
+import { FailableSlotPool, SlotPool } from "./work_pool";
+import { getTransferProfile } from "./transfer_profile";
 
 export interface NodeChange {
   node: SyncNode
@@ -136,73 +141,10 @@ interface SyncMetrics {
   reusedUploadBytes: number
 }
 
-class SlotPool {
-	private active = 0;
-	private readonly waiters: Array<(release: () => void) => void> = [];
-
-	constructor(private readonly limit: number) {}
-
-	async acquire(): Promise<() => void> {
-		if (this.active < this.limit) {
-			this.active++;
-			return this.createRelease();
-		}
-		return await new Promise<() => void>(resolve => this.waiters.push(resolve));
-	}
-
-	private createRelease(): () => void {
-		let released = false;
-		return () => {
-			if (released) return;
-			released = true;
-			this.active--;
-			const waiter = this.waiters.shift();
-			if (waiter) {
-				this.active++;
-				waiter(this.createRelease());
-			}
-		};
-	}
-}
-
-class UploadSlotPool {
-	private active = 0;
-	private failed = false;
-	private failure: unknown;
-	private readonly waiters: Array<{ resolve: (release: () => void) => void, reject: (error: unknown) => void }> = [];
-
-	constructor(private readonly limit: number) {}
-
-	async acquire(): Promise<() => void> {
-		if (this.failed) throw this.failure;
-		if (this.active < this.limit) {
-			this.active++;
-			return this.createRelease();
-		}
-		return await new Promise<() => void>((resolve, reject) => this.waiters.push({ resolve, reject }));
-	}
-
-	fail(error: unknown): void {
-		if (this.failed) return;
-		this.failed = true;
-		this.failure = error;
-		for (const waiter of this.waiters.splice(0)) waiter.reject(error);
-	}
-
-	private createRelease(): () => void {
-		let released = false;
-		return () => {
-			if (released) return;
-			released = true;
-			this.active--;
-			if (this.failed) return;
-			const waiter = this.waiters.shift();
-			if (waiter) {
-				this.active++;
-				waiter.resolve(this.createRelease());
-			}
-		};
-	}
+interface PreparedConflictMerge {
+	result: MergeResult
+	expectedLocal?: { size: number, mtime: number }
+	expectedLocalContent?: string
 }
 
 export interface SYNC_STOP {
@@ -215,21 +157,14 @@ export type SyncStatus = SYNC_IDLE | SYNC_BUSY | SYNC_STOP
 
 export class SyncController {
 	private static readonly LARGE_FILE_WARNING_BYTES = 50 * 1024 * 1024;
-	private static readonly DESKTOP_BLOCK_UPLOAD_CONCURRENCY = 4;
-	private static readonly MOBILE_BLOCK_UPLOAD_CONCURRENCY = 2;
-	private static readonly DESKTOP_FILE_PREPARATION_CONCURRENCY = 4;
-	private static readonly DESKTOP_DOWNLOAD_PREFETCH = 4;
-	private static readonly MOBILE_DOWNLOAD_PREFETCH = 2;
 	private static readonly BLOCK_CHECK_BATCH_SIZE = 1000;
 	private static readonly BLOCK_CHECK_CONCURRENCY = 4;
 	private static readonly FS_UPLOAD_BATCH_SIZE = 100;
 	private static readonly FS_OPERATION_CONCURRENCY = 4;
-	private static readonly DESKTOP_PREPARED_BLOCK_CACHE_BYTES = 32 * 1024 * 1024;
 	private static readonly OBJECT_UPLOAD_ATTEMPTS = 2;
 	private fileIoTail: Promise<void> = Promise.resolve();
-	private readonly filePreparationPool = new SlotPool(Platform.isMobile
-		? 1
-		: SyncController.DESKTOP_FILE_PREPARATION_CONCURRENCY);
+	private readonly transferProfile = getTransferProfile(Platform.isMobile);
+	private readonly filePreparationPool = new SlotPool(this.transferProfile.filePreparationConcurrency);
 	private readonly warnedLargeMobileFiles = new Set<string>();
 	private readonly localStatCache = new Map<string, Promise<Stat | null>>();
 	private readonly localListCache = new Map<string, Promise<string[]>>();
@@ -241,17 +176,24 @@ export class SyncController {
 
 	private ignore: IgnoreList = compileIgnoreList("");
 	private ignoreFileBootstrapped = false;
+	private libraryPolicyBootstrapped = false;
 	private progressCounts: { downloads: number, uploadsPrepared: number, uploads: number, plan: SyncPlan } | null = null;
 	private readonly directoryFsCache = new Map<string, DirSeafFs | null>();
+	private readonly conflictMergeCache = new Map<string, Promise<PreparedConflictMerge>>();
+	private readonly policy: ObsidianSyncPolicy;
+	private pendingPolicySettingsChange = false;
 
 	private nodeRoot: SyncNode;
 
 	public constructor (
     private readonly adapter: DataAdapter,
-	private readonly settings: SeafileSettings) {}
+	private readonly settings: SeafileSettings) {
+		this.policy = new ObsidianSyncPolicy(app?.vault?.configDir ?? ".obsidian", PLUGIN_DIR ? Path.basename(PLUGIN_DIR) : "seafile-improved", settings);
+	}
 
 	public onMassDeletionWarning: ((warning: MassDeletionWarning) => Promise<boolean>) | null = null;
 	public onRepositoryPermissionChanged: ((permission: string) => void) | null = null;
+	public onLibraryPolicyChanged: (() => Promise<void>) | null = null;
 	public onIssue: ((issue: SyncIssueInput) => void) | null = null;
 
 	private normalizePath(path: string): string {
@@ -286,8 +228,8 @@ export class SyncController {
 	}
 
 	private cachePreparedBlock(id: string, data: ArrayBuffer): void {
-		if (!this.preparedBlockCacheEnabled || Platform.isMobile || this.preparedBlocks.has(id)) return;
-		if (this.preparedBlockBytes + data.byteLength > SyncController.DESKTOP_PREPARED_BLOCK_CACHE_BYTES) return;
+		if (!this.preparedBlockCacheEnabled || this.transferProfile.preparedBlockCacheBytes === 0 || this.preparedBlocks.has(id)) return;
+		if (this.preparedBlockBytes + data.byteLength > this.transferProfile.preparedBlockCacheBytes) return;
 		this.preparedBlocks.set(id, data);
 		this.preparedBlockBytes += data.byteLength;
 	}
@@ -347,7 +289,7 @@ export class SyncController {
 	}
 
 	public isPathIgnored(path: string, isDirectory = false): boolean {
-		return this.isInternalPath(path) || this.ignore.denies(path, isDirectory);
+		return this.policy.classify(path, isDirectory).transfer !== "sync" || this.ignore.denies(path, isDirectory);
 	}
 
 	public async readIgnoreFile(): Promise<string> {
@@ -374,10 +316,85 @@ export class SyncController {
 		await this.storeIgnoreFile(contents);
 	}
 
-	private async readRemoteFile(remote: FileSeafDirent): Promise<string> {
+	public async updateManagedIgnoreRules(): Promise<boolean> {
+		if (!await this.adapter.exists(SEAFILE_IGNORE_FILE)) return false;
+		const contents = await this.adapter.read(SEAFILE_IGNORE_FILE);
+		const updated = upsertManagedIgnoreBlock(
+			contents,
+			app.vault.configDir,
+			Path.basename(PLUGIN_DIR),
+			this.settings
+		);
+		if (updated === contents) return false;
+		await this.storeIgnoreFile(updated);
+		return true;
+	}
+
+	public async libraryPolicySettingsChanged(): Promise<void> {
+		this.pendingPolicySettingsChange = true;
+		if (this.status.type === "busy") {
+			this.requestSync();
+			return;
+		}
+		await this.applyPolicySettingsChange();
+		this.requestSync();
+	}
+
+	private async applyPolicySettingsChange(): Promise<void> {
+		if (!this.pendingPolicySettingsChange) return;
+		this.pendingPolicySettingsChange = false;
+		await this.writeLibraryPolicyFile();
+		this.policy.update(this.settings);
+		await this.updateManagedIgnoreRules();
+		this.nodeRoot?.markTreeDirty();
+	}
+
+	public runtimePolicySettingsChanged(): void {
+		this.policy.update(this.settings);
+	}
+
+	public async loadLocalLibraryPolicy(): Promise<boolean> {
+		if (!await this.adapter.exists(LIBRARY_POLICY_FILE)) return false;
+		const policy = parseLibrarySyncPolicy(await this.adapter.read(LIBRARY_POLICY_FILE));
+		const changed = applyLibrarySyncPolicy(this.settings, policy);
+		this.policy.update(this.settings);
+		if (changed) await this.onLibraryPolicyChanged?.();
+		return changed;
+	}
+
+	public async readLibraryPolicyFile(): Promise<string> {
+		if (await this.adapter.exists(LIBRARY_POLICY_FILE)) return await this.adapter.read(LIBRARY_POLICY_FILE);
+		return serializeLibrarySyncPolicy(createLibrarySyncPolicy(this.settings));
+	}
+
+	public async replaceLibraryPolicyFile(contents?: string): Promise<void> {
+		const policy = contents === undefined
+			? createLibrarySyncPolicy(this.settings)
+			: parseLibrarySyncPolicy(contents);
+		await this.storeLibraryPolicyFile(serializeLibrarySyncPolicy(policy));
+		const changed = applyLibrarySyncPolicy(this.settings, policy);
+		this.policy.update(this.settings);
+		this.pendingPolicySettingsChange = false;
+		this.libraryPolicyBootstrapped = true;
+		await this.updateManagedIgnoreRules();
+		this.nodeRoot?.markTreeDirty();
+		if (changed) await this.onLibraryPolicyChanged?.();
+	}
+
+	private async storeLibraryPolicyFile(contents: string, mtime?: number): Promise<void> {
+		if (await this.adapter.exists(LIBRARY_POLICY_FILE) && await this.adapter.read(LIBRARY_POLICY_FILE) === contents) return;
+		await this.adapter.write(LIBRARY_POLICY_FILE, contents, mtime === undefined ? undefined : { mtime });
+		this.nodeRoot?.setDirty("/" + LIBRARY_POLICY_FILE);
+	}
+
+	private async writeLibraryPolicyFile(): Promise<void> {
+		await this.storeLibraryPolicyFile(serializeLibrarySyncPolicy(createLibrarySyncPolicy(this.settings)));
+	}
+
+	private async readRemoteFileBytes(remote: FileSeafDirent, path: string): Promise<Uint8Array> {
 		const [, rawFs] = await server.getFs(remote.id);
 		if (!rawFs || rawFs.type !== TYPE_FILE || !("block_ids" in rawFs) || rawFs.size !== remote.size) {
-			throw new Error(`Remote file metadata failed verification for '${SEAFILE_IGNORE_FILE}'.`);
+			throw new Error(`Remote file metadata failed verification for '${this.normalizePath(path)}'.`);
 		}
 		const bytes = new Uint8Array(remote.size);
 		let offset = 0;
@@ -387,8 +404,12 @@ export class SyncController {
 			bytes.set(block, offset);
 			offset += block.byteLength;
 		}
-		if (offset !== bytes.byteLength) throw new Error("Remote ignore file does not match its declared size.");
-		return new TextDecoder().decode(bytes);
+		if (offset !== bytes.byteLength) throw new Error(`Remote file '${this.normalizePath(path)}' does not match its declared size.`);
+		return bytes;
+	}
+
+	private async readRemoteTextFile(remote: FileSeafDirent, path: string): Promise<string> {
+		return new TextDecoder().decode(await this.readRemoteFileBytes(remote, path));
 	}
 
 	private async getDirectoryFs(id: string): Promise<DirSeafFs | null> {
@@ -407,18 +428,49 @@ export class SyncController {
 			: undefined;
 		const localExists = await this.adapter.exists(SEAFILE_IGNORE_FILE);
 		const localContents = localExists ? await this.adapter.read(SEAFILE_IGNORE_FILE) : "";
-		const remoteContents = remoteIgnore ? await this.readRemoteFile(remoteIgnore) : "";
+		const remoteContents = remoteIgnore ? await this.readRemoteTextFile(remoteIgnore, SEAFILE_IGNORE_FILE) : "";
+		const initialContents = localExists
+			? localContents
+			: remoteIgnore ? remoteContents : DEFAULT_SEAFILE_IGNORE;
+		const managedContents = upsertManagedIgnoreBlock(
+			initialContents,
+			app.vault.configDir,
+			Path.basename(PLUGIN_DIR),
+			this.settings
+		);
 
-		if (!localExists) {
-			await this.storeIgnoreFile(
-				remoteIgnore ? remoteContents : DEFAULT_SEAFILE_IGNORE,
-				remoteIgnore ? remoteIgnore.mtime * 1000 : undefined
-			);
+		if (!localExists || managedContents !== localContents) {
+			const preservesRemoteContents = !localExists && remoteIgnore && managedContents === remoteContents;
+			await this.storeIgnoreFile(managedContents, preservesRemoteContents ? remoteIgnore.mtime * 1000 : undefined);
 		}
 		// When both copies differ, the union is deliberately conservative for
 		// this first traversal. Normal conflict handling then resolves the file.
-		this.ignore = compileIgnoreList([localContents, remoteContents, !localExists && !remoteIgnore ? DEFAULT_SEAFILE_IGNORE : ""].filter(Boolean).join("\n"));
+		this.ignore = compileIgnoreList([managedContents, remoteContents].filter(Boolean).join("\n"));
 		this.ignoreFileBootstrapped = true;
+	}
+
+	private async bootstrapLibraryPolicyFile(remoteRoot: DirSeafDirent): Promise<void> {
+		if (this.libraryPolicyBootstrapped) return;
+		const localExists = await this.adapter.exists(LIBRARY_POLICY_FILE);
+		const trackedPolicy = this.nodeRoot?.find("/" + LIBRARY_POLICY_FILE)?.prev;
+		if (trackedPolicy && localExists) {
+			await this.loadLocalLibraryPolicy();
+			this.libraryPolicyBootstrapped = true;
+			return;
+		}
+		const rawRootFs = await this.getDirectoryFs(remoteRoot.id);
+		const remotePolicy = rawRootFs && rawRootFs.type === 3 && "dirents" in rawRootFs
+			? rawRootFs.dirents.find(entry => entry.name === LIBRARY_POLICY_FILE && entry.mode === MODE_FILE) as FileSeafDirent | undefined
+			: undefined;
+		if (remotePolicy) {
+			const contents = await this.readRemoteTextFile(remotePolicy, LIBRARY_POLICY_FILE);
+			parseLibrarySyncPolicy(contents);
+			await this.storeLibraryPolicyFile(contents, remotePolicy.mtime * 1000);
+		} else if (!localExists) {
+			await this.writeLibraryPolicyFile();
+		}
+		await this.loadLocalLibraryPolicy();
+		this.libraryPolicyBootstrapped = true;
 	}
 
 	// Recursive pull walks siblings concurrently. Serialize the expensive file
@@ -554,6 +606,7 @@ export class SyncController {
 
 		this.localHead = undefined;
 		this.ignoreFileBootstrapped = false;
+		this.libraryPolicyBootstrapped = false;
 		this.consecutiveFailures = 0;
 		this.syncRequested = false;
 		this.pendingStateMayBeStale = false;
@@ -648,7 +701,90 @@ export class SyncController {
 		});
 	}
 
-	async downloadFile (path: string, fsId: string, mtime: number, expectedSize: number, onProgress?: (completedBytes: number) => void) {
+	private prepareConflictMerge(path: string, local: Stat | null, remote: SeafDirent | undefined, node: SyncNode | undefined): Promise<PreparedConflictMerge> {
+		const key = this.normalizePath(path);
+		let prepared = this.conflictMergeCache.get(key);
+		if (prepared) return prepared;
+		prepared = this.computeConflictMerge(path, local, remote, node);
+		this.conflictMergeCache.set(key, prepared);
+		return prepared;
+	}
+
+	private async computeConflictMerge(path: string, local: Stat | null, remote: SeafDirent | undefined, node: SyncNode | undefined): Promise<PreparedConflictMerge> {
+		const expectedLocal = local?.type === "file" ? { size: local.size, mtime: local.mtime } : undefined;
+		const classification = this.policy.classify(path, false);
+		if (classification.merge === "conflict-copy") {
+			return { result: { status: "conflict", reason: "Conflict-copy handling is configured for this file." }, expectedLocal };
+		}
+		if (local?.type !== "file" || remote?.mode !== MODE_FILE || node?.prev?.mode !== MODE_FILE) {
+			return { result: { status: "conflict", reason: "A common file version is not available." }, expectedLocal };
+		}
+		const limit = classification.merge === "markdown" ? 4 * 1024 * 1024 : 2 * 1024 * 1024;
+		if (Math.max(local.size, remote.size, node.prev.size) > limit) {
+			return { result: { status: "conflict", reason: `Automatic ${classification.merge} merges are limited to ${limit / 1024 / 1024} MiB.` }, expectedLocal };
+		}
+		try {
+			const [localText, baseBytes, remoteBytes] = await Promise.all([
+				this.adapter.read(path),
+				this.readRemoteFileBytes(node.prev, path),
+				this.readRemoteFileBytes(remote, path)
+			]);
+			const decoder = new TextDecoder("utf-8", { fatal: true });
+			await this.assertFileUnchanged(path, { size: local.size, mtime: local.mtime });
+			return {
+				result: mergeFileContents(classification.merge, decoder.decode(baseBytes), localText, decoder.decode(remoteBytes)),
+				expectedLocal,
+				expectedLocalContent: localText
+			};
+		} catch (error) {
+			debug.log(`Automatic merge unavailable for '${this.normalizePath(path)}': ${(error as Error).message}`);
+			return { result: { status: "conflict", reason: "The merge base or text content could not be read safely." }, expectedLocal };
+		}
+	}
+
+	private async refreshPreparedConflictMerge(
+		path: string,
+		local: Stat | null,
+		remote: SeafDirent | undefined,
+		node: SyncNode
+	): Promise<{ prepared: PreparedConflictMerge, local: Stat | null }> {
+		let prepared = await this.prepareConflictMerge(path, local, remote, node);
+		if (prepared.result.status === "conflict" || !prepared.expectedLocal) return { prepared, local };
+		const current = await utils.fastStat(path);
+		if (current?.type === "file" && current.size === prepared.expectedLocal.size && current.mtime === prepared.expectedLocal.mtime) {
+			return { prepared, local: current };
+		}
+		this.conflictMergeCache.delete(this.normalizePath(path));
+		this.clearLocalSnapshot();
+		local = await this.getLocalStat(path);
+		prepared = await this.prepareConflictMerge(path, local, remote, node);
+		return { prepared, local };
+	}
+
+	private async writeMergedFile(path: string, content: string, expectedLocalContent: string): Promise<void> {
+		let applied = false;
+		this.ignoreChange.add(path);
+		try {
+			await this.adapter.process(path, current => {
+				if (current !== expectedLocalContent) return current;
+				applied = true;
+				return content;
+			});
+		} finally {
+			this.ignoreChange.delete(path);
+		}
+		if (!applied) throw new Error(`File '${this.normalizePath(path)}' changed while its conflict was being merged.`);
+		this.clearLocalSnapshot();
+	}
+
+	async downloadFile (
+		path: string,
+		fsId: string,
+		mtime: number,
+		expectedSize: number,
+		onProgress?: (completedBytes: number) => void,
+		expectedLocal?: { size: number, mtime: number }
+	) {
 		return await this.withFileIoSlot(async () => {
 			const { tempPath, backupPath, journalPath } = await this.createDownloadStagingPaths(path);
 			let originalMoved = false;
@@ -672,9 +808,7 @@ export class SyncController {
 					if (!rawFs || rawFs.type !== TYPE_FILE || !("block_ids" in rawFs) || rawFs.size !== expectedSize) {
 						throw new Error(`Remote file metadata failed verification for '${path}'.`);
 					}
-					const prefetch = Platform.isMobile
-						? SyncController.MOBILE_DOWNLOAD_PREFETCH
-						: SyncController.DESKTOP_DOWNLOAD_PREFETCH;
+					const prefetch = this.transferProfile.downloadPrefetch;
 					const pending = new Map<number, Promise<ArrayBuffer>>();
 					let nextToFetch = 0;
 					const fillWindow = (): void => {
@@ -715,6 +849,7 @@ export class SyncController {
 					throw new Error(`Downloaded file size verification failed for '${path}'.`);
 				}
 
+				if (expectedLocal) await this.assertFileUnchanged(path, expectedLocal);
 				if (await this.adapter.exists(path)) {
 					await this.adapter.rename(path, backupPath);
 					originalMoved = true;
@@ -760,6 +895,9 @@ export class SyncController {
 			(node?.prev && remote && !node.prevDirty && node.prev.id === remote.id) ||
 			(local && remote && Math.floor(local.mtime / 1000) === remote.mtime && local.type === "file" && remote.mode === MODE_FILE && local.size === remote.size)
 		) return "same";
+		if (!node && local && remote) {
+			return local.type !== "file" && remote.mode !== MODE_FILE ? "merge" : "conflict";
+		}
 
 		if (
 			(!remote && !node?.prev) ||
@@ -779,7 +917,8 @@ export class SyncController {
 	private async countLocalUploadFiles(path: string): Promise<number> {
 		if (this.isInternalPath(path)) return 0;
 		const local = await this.getLocalStat(path);
-		if (!local || this.ignore.denies(path, local.type === "folder")) return 0;
+		if (!local || this.policy.classify(path, local.type === "folder").transfer !== "sync"
+			|| this.ignore.denies(path, local.type === "folder")) return 0;
 		if (local.type === "file") return 1;
 		const counts = await Promise.all((await this.getLocalList(path)).map(async name => await this.countLocalUploadFiles(`${path}/${name}`)));
 		return counts.reduce((total, count) => total + count, 0);
@@ -806,6 +945,7 @@ export class SyncController {
 	}
 
 	private countTrackedFiles(node: SyncNode = this.nodeRoot): number {
+		if (node.policyExcluded) return 0;
 		if (node.prev?.mode === MODE_FILE) return 1;
 		return Object.values(node.getChildren()).reduce((sum, child) => sum + this.countTrackedFiles(child), 0);
 	}
@@ -816,26 +956,33 @@ export class SyncController {
 
 		const local = await this.getLocalStat(path);
 		const isDirectory = local?.type === "folder" || remote?.mode === MODE_DIR || node?.prev?.mode === MODE_DIR;
+		if (this.policy.classify(path, isDirectory).transfer !== "sync") return plan;
+		const baselineNode = node?.policyExcluded ? undefined : node;
 		const ignored = this.ignore.denies(path, isDirectory);
-		if (ignored && !remote && !node?.prev) return plan;
-		if (ignored && node?.prev && remote && node.prev.id === remote.id) return plan;
+		if (ignored && !remote && !baselineNode?.prev) return plan;
+		if (ignored && baselineNode?.prev && remote && baselineNode.prev.id === remote.id) return plan;
 		if (path) {
 			const pathIssue = validatePathSegment(path);
 			if (pathIssue) plan.pathIssues.push(pathIssue);
 		}
 
-		let target = this.determineTarget(local, remote, node);
+		let target = this.determineTarget(local, remote, baselineNode);
 		if (target === "same") return plan;
 		if (target === "conflict") {
 			if (local && !remote) target = "local";
 			else if (!local && remote) target = "remote";
 			else {
-				// The local side will be preserved as a conflict copy and uploaded,
-				// while the remote side is downloaded at the original path.
-				if (local?.type === "file") plan.uploads++;
-				else if (local?.type === "folder") plan.uploads += await this.countLocalUploadFiles(path);
-				plan.requiresRemoteWrite = true;
-				target = "remote";
+				const merge = (await this.prepareConflictMerge(path, local, remote, baselineNode)).result;
+				if (merge.status === "remote") target = "remote";
+				else if (merge.status === "local" || merge.status === "merged") target = "local";
+				else {
+					// The local side will be preserved as a conflict copy and uploaded,
+					// while the remote side is downloaded at the original path.
+					if (local?.type === "file") plan.uploads++;
+					else if (local?.type === "folder") plan.uploads += await this.countLocalUploadFiles(path);
+					plan.requiresRemoteWrite = true;
+					target = "remote";
+				}
 			}
 		}
 		if (target === "remote" && !remote && local) {
@@ -861,7 +1008,7 @@ export class SyncController {
 				names.add(child.name);
 			}
 		}
-		const nodeChildren = node?.getChildren() ?? {};
+		const nodeChildren = baselineNode?.getChildren() ?? {};
 		if (recurse) for (const name of Object.keys(nodeChildren)) names.add(name);
 		if (recurse) {
 			plan.pathIssues.push(...findCaseCollisions(path, names));
@@ -917,6 +1064,24 @@ export class SyncController {
 		// Step 1. Check file status: same, local, remote, merge, conflict
 		let local = await this.getLocalStat(path);
 		const isDirectory = local?.type === "folder" || remote?.mode === MODE_DIR || node.prev?.mode === MODE_DIR;
+		const classification = this.policy.classify(path, isDirectory);
+		if (classification.transfer !== "sync") {
+			node.clearPendingTree();
+			if (remote) {
+				if (remote.mode === MODE_DIR) node.clearChildren();
+				await node.setPrevAsync(remote, false);
+				await node.setPolicyExcludedAsync(true);
+				node.state = { type: "sync" };
+			} else {
+				await node.delete();
+			}
+			return;
+		}
+		if (node.policyExcluded) {
+			node.clearChildren();
+			await node.setPolicyExcludedAsync(false);
+			await node.setPrevAsync(undefined, true);
+		}
 		const ignored = this.ignore.denies(path, isDirectory);
 
 		// Seafile ignore rules are upload-side exclusions. New local entries are
@@ -950,9 +1115,27 @@ export class SyncController {
 			if (local && !remote) target = "local";
 			else if (!local && remote) target = "remote";
 			else {
-				await this.preserveLocalConflict(changes, path, node);
-				local = null;
-				target = "remote";
+				const refreshed = await this.refreshPreparedConflictMerge(path, local, remote, node);
+				local = refreshed.local;
+				const merge = refreshed.prepared.result;
+				if (merge.status === "conflict") {
+					debug.log(`Could not automatically merge '${this.normalizePath(path)}': ${merge.reason}`);
+					await this.preserveLocalConflict(changes, path, node);
+					local = null;
+					target = "remote";
+				} else if (merge.status === "local") {
+					target = "local";
+				} else if (merge.status === "remote") {
+					target = "remote";
+				} else {
+					if (refreshed.prepared.expectedLocalContent === undefined) {
+						throw new Error(`The local merge input for '${this.normalizePath(path)}' is unavailable.`);
+					}
+					await this.writeMergedFile(path, merge.content, refreshed.prepared.expectedLocalContent);
+					local = await this.getLocalStat(path);
+					target = "local";
+					debug.log(`Automatically merged '${this.normalizePath(path)}' using ${classification.merge}.`);
+				}
 			}
 		}
 
@@ -1047,7 +1230,7 @@ export class SyncController {
 					await this.downloadFile(path, remote.id, remote.mtime, remote.size, completedBytes => {
 						const progress = remote.size === 0 ? 1 : completedBytes / remote.size;
 						if (node.state.type === "download") node.state.param = progress;
-					});
+					}, local?.type === "file" ? { size: local.size, mtime: local.mtime } : undefined);
 					if (this.progressCounts) {
 						this.progressCounts.downloads++;
 						this.reportProgress({
@@ -1259,7 +1442,7 @@ export class SyncController {
 		return missing;
 	}
 
-	private async uploadBlockIndices (node: SyncNode, state: STATE_UPLOAD, blockIds: string[], missingIndices: ReadonlySet<number>, pool: UploadSlotPool): Promise<void> {
+	private async uploadBlockIndices (node: SyncNode, state: STATE_UPLOAD, blockIds: string[], missingIndices: ReadonlySet<number>, pool: FailableSlotPool): Promise<void> {
 		const source = state.param.source!;
 		let completed = 0;
 		const pending: Promise<void>[] = [];
@@ -1363,9 +1546,7 @@ export class SyncController {
 			}
 			return { upload, indices };
 		});
-		const pool = new UploadSlotPool(Platform.isMobile
-			? SyncController.MOBILE_BLOCK_UPLOAD_CONCURRENCY
-			: SyncController.DESKTOP_BLOCK_UPLOAD_CONCURRENCY);
+		const pool = new FailableSlotPool(this.transferProfile.blockUploadConcurrency);
 		const run = async ({ upload, indices }: typeof assignments[number]): Promise<void> => {
 			if (indices.size > 0) await this.uploadBlockIndices(upload.node, upload.state, upload.blockIds, indices, pool);
 			if (reportFiles) this.reportUploadedFile();
@@ -1596,6 +1777,7 @@ export class SyncController {
 	async notifyChange (path: string, type: "create" | "modify" | "delete") {
 		if (this.ignoreChange.has(path)) return;
 		if (this.isInternalPath(path)) return;
+		if (this.policy.classify(path).transfer !== "sync") return;
 		if (this.normalizePath(path) === SEAFILE_IGNORE_FILE) {
 			const contents = type === "delete" ? "" : await this.adapter.read(SEAFILE_IGNORE_FILE);
 			this.ignore = compileIgnoreList(contents);
@@ -1628,12 +1810,14 @@ export class SyncController {
 
 	async sync () {
 		if (this.localHead === undefined) throw new Error("Sync controller is not initialized.");
+		await this.applyPolicySettingsChange();
 		// Pending filesystem objects are derived state. A failed or interrupted
 		// attempt must never carry them into a later reconciliation, where an
 		// otherwise identical remote tree could turn them into an empty commit.
 		if (this.pendingStateMayBeStale) this.nodeRoot.clearPendingTree();
 		this.progressCounts = null;
 		this.directoryFsCache.clear();
+		this.conflictMergeCache.clear();
 		this.clearLocalSnapshot();
 		this.clearPreparedBlocks();
 		this.syncMetrics = this.settings.devMode ? {
@@ -1645,6 +1829,7 @@ export class SyncController {
 			const [remoteHead, remoteRoot, repoPermission] = await this.measurePhase("fetch remote metadata", async () => {
 				const [head, permission] = await Promise.all([server.getHeadCommitId(), server.getRepoPermission()]);
 				const root = await server.getCommitRoot(head);
+				await this.bootstrapLibraryPolicyFile(root);
 				await this.bootstrapIgnoreFile(root);
 				return [head, root, permission] as const;
 			});
@@ -1682,9 +1867,15 @@ export class SyncController {
 				await this.measurePhase("compact local sync state", async () => { await SyncNode.save(this.nodeRoot); });
 				this.reportProgress({ operation: "compact-state", completedItems: 1, totalItems: 1 });
 			}
+			if (await this.loadLocalLibraryPolicy()) {
+				await this.updateManagedIgnoreRules();
+				this.nodeRoot.markTreeDirty();
+				this.syncRequested = true;
+			}
 		} finally {
 			this.progressCounts = null;
 			this.directoryFsCache.clear();
+			this.conflictMergeCache.clear();
 			this.clearLocalSnapshot();
 			this.preparedBlockCacheEnabled = false;
 			this.clearPreparedBlocks();
@@ -1739,10 +1930,12 @@ export class SyncController {
 		if (this.status.type === "busy") throw new Error("Wait for the current synchronization to finish before verifying the vault.");
 		if (!this.nodeRoot || this.localHead === undefined) throw new Error("Sync controller is not initialized.");
 		this.directoryFsCache.clear();
+		this.conflictMergeCache.clear();
 		this.clearLocalSnapshot();
 		try {
 			const [remoteHead, permission] = await Promise.all([server.getHeadCommitId(), server.getRepoPermission()]);
 			const remoteRoot = await server.getCommitRoot(remoteHead);
+			await this.bootstrapLibraryPolicyFile(remoteRoot);
 			await this.bootstrapIgnoreFile(remoteRoot);
 			const plan = await this.planSync("", this.nodeRoot, remoteRoot);
 			return {
@@ -1759,6 +1952,7 @@ export class SyncController {
 			};
 		} finally {
 			this.directoryFsCache.clear();
+			this.conflictMergeCache.clear();
 			this.clearLocalSnapshot();
 		}
 	}
@@ -1828,7 +2022,8 @@ export class SyncController {
 				debug.error(e);
 				const issue: SyncIssueInput = {
 					kind: e instanceof SyncSafetyInterlockError ? "safety" : e instanceof SyncPreflightError ? "preflight" : "error",
-					message: failureMessage ?? "Unknown sync error"
+					message: failureMessage ?? "Unknown sync error",
+					action: e instanceof LibraryPolicyError ? "repair-library-policy" : undefined
 				};
 				const reportImmediately = e instanceof RepositoryUnavailableError
 					|| e instanceof SyncSafetyInterlockError

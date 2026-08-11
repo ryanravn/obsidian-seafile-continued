@@ -1,4 +1,4 @@
-import { Notice, Plugin, TFile, normalizePath } from "obsidian";
+import { Notice, Platform, Plugin, TFile, apiVersion, normalizePath, type Stat } from "obsidian";
 import { ensurePluginGitignore, initConfig, PLUGIN_DIR } from "./config";
 import { SEAFILE_IGNORE_FILE } from "./ignore";
 import { RepoCrypto } from "./crypto";
@@ -19,8 +19,13 @@ import { HISTORY_VIEW_TYPE, HistoryView } from "./ui/history_view";
 import { HttpError } from "./server";
 import Dialog from "./ui/dialog_modal";
 import { CredentialStore, withoutPersistedTokens } from "./credential_store";
-import { SyncIssueStore } from "./sync/issues";
+import { SyncIssueStore, type SyncIssue } from "./sync/issues";
 import { VaultVerificationModal } from "./ui/verification_modal";
+import { attemptStartupMaintenance, type StartupMaintenanceFailure } from "./startup";
+import { assertReviewedFileUnchanged, normalizeConflictPaths } from "./sync/conflict_resolution";
+import { createDiagnosticsReport } from "./diagnostics";
+import { DiagnosticsModal } from "./ui/diagnostics_modal";
+import { LibraryPolicyError } from "./sync/library_policy";
 
 export default class SeafilePlugin extends Plugin {
 	settings: SeafileSettings;
@@ -36,11 +41,28 @@ export default class SeafilePlugin extends Plugin {
 	async onload(): Promise<void> {
 		this.settings = await this.loadSettings();
 		this.server = new Server(this.settings, this);
-		initConfig(this.app, this.server, this.manifest.id);
-		await ensurePluginGitignore();
-
+		initConfig(this.app, this.server, this.manifest.id, this.settings);
 		this.issues = new SyncIssueStore(this.app);
+		const reportMaintenanceFailure = ({ operation, error }: StartupMaintenanceFailure): void => {
+			debug.warn(`[Obsidian Seafile Sync] ${operation} failed during startup.`, error);
+			this.issues.add({
+				kind: "error",
+				message: `${operation} failed during startup: ${error.message}`,
+				action: error instanceof LibraryPolicyError ? "repair-library-policy" : undefined
+			});
+		};
+		await attemptStartupMaintenance("Plugin runtime ignore maintenance", ensurePluginGitignore, reportMaintenanceFailure);
+
 		this.sync = new SyncController(this.app.vault.adapter, this.settings);
+		this.sync.onLibraryPolicyChanged = async () => { await this.saveSettings(); };
+		await attemptStartupMaintenance(
+			"Library sync policy maintenance",
+			async () => {
+				await this.sync.loadLocalLibraryPolicy();
+				await this.sync.updateManagedIgnoreRules();
+			},
+			reportMaintenanceFailure
+		);
 		this.sync.onMassDeletionWarning = async warning => await this.confirmMassDeletion(warning);
 		this.sync.onRepositoryPermissionChanged = () => { void this.saveSettings(); };
 		this.sync.onIssue = issue => { this.issues.add(issue); };
@@ -117,6 +139,11 @@ export default class SeafilePlugin extends Plugin {
 			name: "Open sync issues",
 			callback: () => { void this.openHistoryView("issues"); },
 		});
+		this.addCommand({
+			id: "open-diagnostics",
+			name: "Open diagnostics report",
+			callback: () => { this.openDiagnostics(); },
+		});
 
 		if (this.settings.devMode) {
 			(window as unknown as Record<string, unknown>)["seafile"] = this; // for debug
@@ -140,6 +167,33 @@ export default class SeafilePlugin extends Plugin {
 		new FileHistoryModal(this.app, this, normalizePath(path)).open();
 	}
 
+	openDiagnostics(): void {
+		new DiagnosticsModal(this.app, createDiagnosticsReport({
+			pluginVersion: this.manifest.version,
+			obsidianVersion: apiVersion,
+			platform: { desktop: Platform.isDesktop, mobile: Platform.isMobile },
+			settings: this.settings,
+			syncStatus: this.sync.status,
+			notificationStatus: this.notifications.status,
+			knownRemoteHead: this.sync.getKnownRemoteHead(),
+			locallySynchronized: this.sync.isLocallySynchronized(),
+			issues: this.issues.list()
+		})).open();
+	}
+
+	async readLibraryPolicy(): Promise<string> {
+		return await this.sync.readLibraryPolicyFile();
+	}
+
+	async repairLibraryPolicy(contents?: string): Promise<void> {
+		await this.sync.replaceLibraryPolicyFile(contents);
+		await this.saveSettings();
+		this.issues.resolveByAction("repair-library-policy");
+		if (!this.settings.enableSync) return;
+		if (this.sync.status.type === "stop" && this.sync.status.message === "error") this.sync.startSync();
+		else this.sync.requestSync();
+	}
+
 	openDeletedFileHistory(entry: DeletedEntry): void {
 		const path = normalizePath(`${entry.parentDir}/${entry.name}`);
 		const revision: FileRevision = {
@@ -154,6 +208,33 @@ export default class SeafilePlugin extends Plugin {
 			deleted: true
 		};
 		new FileHistoryModal(this.app, this, path, revision).open();
+	}
+
+	async resolveSyncConflict(
+		issue: SyncIssue,
+		resolution: "current" | "conflict" | "both",
+		reviewed: { current: Stat | null, conflict: Stat | null, conflictContent?: ArrayBuffer }
+	): Promise<void> {
+		if (issue.kind !== "conflict" || !issue.path || !issue.relatedPath) throw new Error("This issue has no resolvable conflict files.");
+		const { currentPath, conflictPath } = normalizeConflictPaths(issue.path, issue.relatedPath);
+		const current = await this.app.vault.adapter.stat(currentPath);
+		const conflict = await this.app.vault.adapter.stat(conflictPath);
+		if (resolution === "conflict") {
+			assertReviewedFileUnchanged(currentPath, reviewed.current, current);
+			assertReviewedFileUnchanged(conflictPath, reviewed.conflict, conflict);
+			if (conflict?.type !== "file" || !reviewed.conflictContent) throw new Error("The preserved local conflict copy is no longer available.");
+			await this.writeRestoredFile(currentPath, reviewed.conflictContent, conflict.mtime, false);
+		}
+		if (resolution !== "both") {
+			if (resolution === "current") assertReviewedFileUnchanged(conflictPath, reviewed.conflict, conflict);
+			if (conflict?.type === "file") {
+				await this.checkpoints.capture(conflictPath, true);
+				await this.app.vault.adapter.remove(conflictPath);
+				await this.sync.notifyChange("/" + conflictPath, "delete");
+			}
+			this.sync.requestSync();
+		}
+		this.issues.resolve(issue.id);
 	}
 
 	async openHistoryView(tab: "activity" | "file" | "snapshots" | "deleted" | "issues" = "activity", filePath = ""): Promise<void> {
@@ -519,6 +600,9 @@ export default class SeafilePlugin extends Plugin {
 	async loadSettings(): Promise<SeafileSettings> {
 		const data = await this.loadData() as Partial<SeafileSettings> | null;
 		const settings: SeafileSettings = Object.assign({}, DEFAULT_SETTINGS, data);
+		// Preserve the historical "sync everything" behavior for existing users.
+		// New installations use the safer Obsidian-aware default.
+		if (data && data.syncAdditionalPluginData === undefined) settings.syncAdditionalPluginData = true;
 		this.credentialStore = new CredentialStore(this.app);
 		const migratedCredentials = this.credentialStore.hydrate(settings);
 		if (!["always", "syncing", "never"].includes(settings.syncStatusTextMode)) {
@@ -526,6 +610,16 @@ export default class SeafilePlugin extends Plugin {
 		}
 		if (![0, 1, 5, 15].includes(settings.historyGroupingMinutes)) {
 			settings.historyGroupingMinutes = DEFAULT_SETTINGS.historyGroupingMinutes;
+		}
+		if (!["smart-merge", "conflict-copy"].includes(settings.conflictResolution)) {
+			settings.conflictResolution = DEFAULT_SETTINGS.conflictResolution;
+		}
+		if (!settings.pluginSyncOverrides || typeof settings.pluginSyncOverrides !== "object" || Array.isArray(settings.pluginSyncOverrides)) {
+			settings.pluginSyncOverrides = {};
+		} else {
+			settings.pluginSyncOverrides = Object.fromEntries(Object.entries(settings.pluginSyncOverrides)
+				.filter((entry): entry is [string, "standard" | "all" | "ignore"] =>
+					["standard", "all", "ignore"].includes(entry[1])));
 		}
 		if (!Number.isFinite(settings.localHistoryIntervalMinutes) || settings.localHistoryIntervalMinutes < 1) settings.localHistoryIntervalMinutes = 5;
 		if (!Number.isFinite(settings.localHistoryRetentionDays) || settings.localHistoryRetentionDays < 1) settings.localHistoryRetentionDays = 7;

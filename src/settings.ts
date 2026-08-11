@@ -1,5 +1,7 @@
 export type SyncStatusTextMode = "always" | "syncing" | "never"
 export type HistoryGroupingMinutes = 0 | 1 | 5 | 15
+export type ConflictResolutionMode = "smart-merge" | "conflict-copy"
+export type PluginSyncMode = "default" | "standard" | "all" | "ignore"
 
 export interface SeafileSettings {
   host: string
@@ -28,6 +30,16 @@ export interface SeafileSettings {
 	deletionProtectionPercentThreshold: number
 	deletionProtectionPercentMinimumFiles: number
 	repoPermission: string
+	conflictResolution: ConflictResolutionMode
+	syncMainSettings: boolean
+	syncAppearance: boolean
+	syncHotkeys: boolean
+	syncCorePluginSettings: boolean
+	syncCommunityPluginList: boolean
+	syncCommunityPluginInstallations: boolean
+	syncCommunityPluginSettings: boolean
+	syncAdditionalPluginData: boolean
+	pluginSyncOverrides: Record<string, PluginSyncMode>
 
   // Encryption metadata (public, server-supplied). Password is never persisted.
   encrypted: boolean
@@ -64,6 +76,16 @@ export const DEFAULT_SETTINGS: SeafileSettings = {
 	deletionProtectionPercentThreshold: 25,
 	deletionProtectionPercentMinimumFiles: 20,
 	repoPermission: "",
+	conflictResolution: "smart-merge",
+	syncMainSettings: true,
+	syncAppearance: true,
+	syncHotkeys: true,
+	syncCorePluginSettings: true,
+	syncCommunityPluginList: true,
+	syncCommunityPluginInstallations: true,
+	syncCommunityPluginSettings: true,
+	syncAdditionalPluginData: false,
+	pluginSyncOverrides: {},
 	encrypted: false,
 	encVersion: 0,
 	repoSalt: "",

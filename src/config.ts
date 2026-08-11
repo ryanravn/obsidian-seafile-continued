@@ -1,6 +1,7 @@
 import { App, DataAdapter } from "obsidian";
 import Server from "./server";
 import { createDefaultIgnoreFile } from "./ignore";
+import type { SeafileSettings } from "./settings";
 
 export let PLUGIN_DIR: string;
 export let SYNC_DLOG_PATH: string;
@@ -14,7 +15,7 @@ export let app: App;
 export let adapter: DataAdapter;
 export let server: Server;
 
-export function initConfig(app_: App, server_: Server, pluginId: string) {
+export function initConfig(app_: App, server_: Server, pluginId: string, settings?: SeafileSettings) {
 	app = app_;
 	server = server_;
 	adapter = app.vault.adapter;
@@ -26,10 +27,10 @@ export function initConfig(app_: App, server_: Server, pluginId: string) {
 	DOWNLOAD_STAGING_PATH = PLUGIN_DIR + "/" + "download_staging";
 	PLUGIN_GITIGNORE_PATH = PLUGIN_DIR + "/" + ".gitignore";
 
-	DEFAULT_SEAFILE_IGNORE = createDefaultIgnoreFile(app.vault.configDir, pluginId);
+	DEFAULT_SEAFILE_IGNORE = createDefaultIgnoreFile(app.vault.configDir, pluginId, settings);
 }
 
-export const PLUGIN_GITIGNORE_CONTENT = "head_commit\nsync_data\nsync_dlog\ndownload_staging\n";
+export const PLUGIN_GITIGNORE_CONTENT = "head_commit\nsync_data\nsync_dlog\ndownload_staging\nhistory\n";
 
 export async function ensurePluginGitignore(): Promise<void> {
 	if (!await adapter.exists(PLUGIN_GITIGNORE_PATH)) {

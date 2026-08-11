@@ -21,7 +21,7 @@ describe("plugin runtime-data gitignore", () => {
 		await ensurePluginGitignore();
 
 		expect(PLUGIN_GITIGNORE_PATH).toBe(".obsidian/plugins/seafile-improved/.gitignore");
-		expect(files.get(PLUGIN_GITIGNORE_PATH)).toBe("head_commit\nsync_data\nsync_dlog\ndownload_staging\n");
+		expect(files.get(PLUGIN_GITIGNORE_PATH)).toBe("head_commit\nsync_data\nsync_dlog\ndownload_staging\nhistory\n");
 		expect(files.get(PLUGIN_GITIGNORE_PATH)).toBe(PLUGIN_GITIGNORE_CONTENT);
 	});
 
@@ -30,6 +30,14 @@ describe("plugin runtime-data gitignore", () => {
 
 		await ensurePluginGitignore();
 
-		expect(files.get(PLUGIN_GITIGNORE_PATH)).toBe("custom-entry\nhead_commit\nsync_data\nsync_dlog\ndownload_staging\n");
+		expect(files.get(PLUGIN_GITIGNORE_PATH)).toBe("custom-entry\nhead_commit\nsync_data\nsync_dlog\ndownload_staging\nhistory\n");
+	});
+
+	test("upgrades an existing generated file without replacing its contents", async () => {
+		const files = setup("head_commit\nsync_data\nsync_dlog\ndownload_staging\n");
+
+		await ensurePluginGitignore();
+
+		expect(files.get(PLUGIN_GITIGNORE_PATH)).toBe("head_commit\nsync_data\nsync_dlog\ndownload_staging\nhistory\n");
 	});
 });

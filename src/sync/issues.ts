@@ -1,12 +1,14 @@
 import type { App } from "obsidian";
 
 export type SyncIssueKind = "conflict" | "error" | "safety" | "preflight" | "recovery";
+export type SyncIssueAction = "repair-library-policy";
 
 export interface SyncIssueInput {
 	kind: SyncIssueKind
 	message: string
 	path?: string
 	relatedPath?: string
+	action?: SyncIssueAction
 }
 
 export interface SyncIssue extends SyncIssueInput {
@@ -55,7 +57,8 @@ export class SyncIssueStore {
 		if (!shouldSurfaceSyncIssue(input)) return null;
 		const now = Date.now();
 		const existing = this.issues.find(issue => !issue.resolved && issue.kind === input.kind
-			&& issue.path === input.path && issue.relatedPath === input.relatedPath && issue.message === input.message);
+			&& issue.path === input.path && issue.relatedPath === input.relatedPath
+			&& issue.action === input.action && issue.message === input.message);
 		if (existing) {
 			existing.lastSeenAt = now;
 			existing.occurrences++;
@@ -81,6 +84,16 @@ export class SyncIssueStore {
 		if (!issue) return;
 		issue.resolved = resolved;
 		this.persist();
+	}
+
+	resolveByAction(action: SyncIssueAction): void {
+		let changed = false;
+		for (const issue of this.issues) {
+			if (issue.action !== action || issue.resolved) continue;
+			issue.resolved = true;
+			changed = true;
+		}
+		if (changed) this.persist();
 	}
 
 	clearResolved(): void {

@@ -1,4 +1,4 @@
-import { type App, Notice, PluginSettingTab, type SettingDefinitionItem } from "obsidian";
+import { type App, Notice, PluginSettingTab, type Setting, type SettingDefinitionItem } from "obsidian";
 import type SeafilePlugin from "src/main";
 import { debug } from "src/utils";
 import { server } from "src/config";
@@ -11,9 +11,10 @@ import RepoModal from "./repo_modal";
 import TokenLoginModal from "./token_login_modal";
 import { resolveNotificationUrl, type NotificationStatus } from "src/notification";
 import type { SyncStatus } from "src/sync/controller";
-import type { HistoryGroupingMinutes, SyncStatusTextMode } from "src/settings";
+import type { ConflictResolutionMode, HistoryGroupingMinutes, SyncStatusTextMode } from "src/settings";
 import { formatSyncActivity } from "./sync_progress";
 import { describeOnboardingStep, getOnboardingStep } from "./onboarding";
+import { formatPluginSyncOverrides, parsePluginSyncOverrides } from "src/sync/policy";
 
 export class SeafileSettingTab extends PluginSettingTab {
 	constructor(public app: App, private readonly plugin: SeafilePlugin) {
@@ -229,6 +230,101 @@ export class SeafileSettingTab extends PluginSettingTab {
 							this.plugin.explorerView?.syncStatusChanged(this.plugin.sync.status);
 						}));
 				}
+			},
+			{
+				name: "Conflict handling",
+				desc: "Device-local preference. Smart merge combines independent Markdown, text, and JSON changes using the last synchronized version. Ambiguous changes are always preserved as conflict copies.",
+				aliases: ["automatic merge", "conflict copy", "three-way merge"],
+				render: setting => {
+					setting.addDropdown(dropdown => dropdown
+						.addOption("smart-merge", "Smart merge")
+						.addOption("conflict-copy", "Always create conflict copies")
+						.setValue(settings.conflictResolution)
+						.onChange(async value => {
+							settings.conflictResolution = value as ConflictResolutionMode;
+							await this.plugin.saveSettings();
+							this.plugin.sync.runtimePolicySettingsChanged();
+						}));
+				}
+			},
+			{
+				type: "group",
+				heading: "Library sync policy",
+				items: [
+					{
+						name: "Shared across devices",
+						desc: "Every choice in this section is stored in the vault's shared policy file and adopted by all Obsidian Seafile Sync devices using this library."
+					},
+					{
+						name: "Main Obsidian settings",
+						desc: "Synchronize the main vault configuration, including app.json and other non-plugin configuration files.",
+						aliases: ["vault configuration", "app json"],
+						render: setting => this.addPolicyToggle(setting, settings.syncMainSettings, value => { settings.syncMainSettings = value; })
+					},
+					{
+						name: "Appearance, themes, and snippets",
+						desc: "Synchronize appearance.json plus installed themes and CSS snippets.",
+						aliases: ["CSS", "theme sync"],
+						render: setting => this.addPolicyToggle(setting, settings.syncAppearance, value => { settings.syncAppearance = value; })
+					},
+					{
+						name: "Hotkeys",
+						desc: "Synchronize custom keyboard shortcuts from hotkeys.json.",
+						aliases: ["keyboard shortcuts"],
+						render: setting => this.addPolicyToggle(setting, settings.syncHotkeys, value => { settings.syncHotkeys = value; })
+					},
+					{
+						name: "Core plugin settings",
+						desc: "Synchronize the active core plugin list and core-plugin configuration files.",
+						aliases: ["built-in plugins", "core plugins"],
+						render: setting => this.addPolicyToggle(setting, settings.syncCorePluginSettings, value => { settings.syncCorePluginSettings = value; })
+					},
+					{
+						name: "Active community plugin list",
+						desc: "Synchronize which community plugins are enabled.",
+						aliases: ["community-plugins.json", "enabled plugins"],
+						render: setting => this.addPolicyToggle(setting, settings.syncCommunityPluginList, value => { settings.syncCommunityPluginList = value; })
+					},
+					{
+						name: "Community plugin installation files",
+						desc: "Synchronize manifest.json, main.js, and styles.css for installed community plugins.",
+						aliases: ["installed plugins", "plugin code"],
+						render: setting => this.addPolicyToggle(setting, settings.syncCommunityPluginInstallations, value => { settings.syncCommunityPluginInstallations = value; })
+					},
+					{
+						name: "Community plugin settings",
+						desc: "Synchronize each community plugin's standard data.json settings file with JSON-aware conflict handling.",
+						aliases: ["plugin data.json", "plugin configuration"],
+						render: setting => this.addPolicyToggle(setting, settings.syncCommunityPluginSettings, value => { settings.syncCommunityPluginSettings = value; })
+					},
+					{
+						name: "Additional community plugin data",
+						desc: "Synchronize files beyond manifest.json, main.js, styles.css, and data.json. Keep enabled for plugins that store user content in custom files; new installations default to disabled.",
+						aliases: ["plugin cache", "plugin storage", "extra plugin files"],
+						render: setting => this.addPolicyToggle(setting, settings.syncAdditionalPluginData, value => { settings.syncAdditionalPluginData = value; })
+					},
+					{
+						name: "Per-plugin sync overrides",
+						desc: "Optional one-per-line rules: plugin-id=standard syncs installation files and data.json, =all includes custom data, and =ignore keeps the whole plugin device-local.",
+						aliases: ["plugin policy", "plugin exclusions"],
+						render: setting => {
+							let value = formatPluginSyncOverrides(settings.pluginSyncOverrides);
+							setting.addTextArea(text => {
+								text.setPlaceholder("plugin-id=standard");
+								text.inputEl.rows = 5;
+								text.setValue(value).onChange(next => { value = next; });
+							}).addButton(button => button.setButtonText("Save").onClick(async () => {
+								try {
+									settings.pluginSyncOverrides = parsePluginSyncOverrides(value);
+									await this.saveLibraryPolicySettings();
+									new Notice("Per-plugin synchronization rules saved");
+								} catch (error) {
+									new Notice((error as Error).message);
+								}
+							}));
+						}
+					}
+				]
 			},
 			{
 				name: "Manual sync",
@@ -472,7 +568,7 @@ export class SeafileSettingTab extends PluginSettingTab {
 			},
 			{
 				name: "Seafile ignore file",
-				desc: `Edit ${SEAFILE_IGNORE_FILE} in the library root. The same rules are used by standard Seafile clients; the plugin creates this file automatically when necessary.`,
+				desc: `Edit ${SEAFILE_IGNORE_FILE} in the library root. The marked managed section reflects compatible Obsidian-aware defaults; add custom rules below it for standard Seafile clients and this plugin.`,
 				aliases: ["ignore list", "excluded files", "git folder"],
 				render: setting => {
 					let ignoreContents = "";
@@ -542,6 +638,16 @@ export class SeafileSettingTab extends PluginSettingTab {
 						} finally {
 							button.setDisabled(false);
 						}
+					}));
+				}
+			},
+			{
+				name: "Diagnostics report",
+				desc: "Review and copy a sanitized support report without credentials, server identifiers, file paths, issue messages, or commit IDs.",
+				aliases: ["support information", "debug report", "troubleshooting"],
+				render: setting => {
+					setting.addButton(button => button.setButtonText("Open report").onClick(() => {
+						this.plugin.openDiagnostics();
 					}));
 				}
 			},
@@ -698,6 +804,18 @@ export class SeafileSettingTab extends PluginSettingTab {
 		settings.repoMagic = "";
 		settings.randomKey = "";
 		server.crypto = null;
+	}
+
+	private addPolicyToggle(setting: Setting, value: boolean, update: (value: boolean) => void): void {
+		setting.addToggle(toggle => toggle.setValue(value).onChange(async next => {
+			update(next);
+			await this.saveLibraryPolicySettings();
+		}));
+	}
+
+	private async saveLibraryPolicySettings(): Promise<void> {
+		await this.plugin.saveSettings();
+		await this.plugin.sync.libraryPolicySettingsChanged();
 	}
 
 	private describeSyncStatus(status: SyncStatus): string {

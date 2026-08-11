@@ -30,6 +30,18 @@ describe("sync issue store", () => {
 		expect(store.list()).toEqual([]);
 	});
 
+	test("resolves all issues associated with a completed recovery action", () => {
+		const store = new SyncIssueStore(fakeApp());
+		store.add({ kind: "error", message: "Invalid policy", action: "repair-library-policy" });
+		store.add({ kind: "error", message: "Invalid policy during startup", action: "repair-library-policy" });
+		store.add({ kind: "error", message: "Unrelated" });
+
+		store.resolveByAction("repair-library-policy");
+
+		expect(store.list().filter(issue => issue.action === "repair-library-policy").every(issue => issue.resolved)).toBe(true);
+		expect(store.list().find(issue => issue.message === "Unrelated")?.resolved).toBe(false);
+	});
+
 	test("does not retain self-healing synchronization races", () => {
 		const transient = [
 			"File 'note.md' changed while it was being synchronized. It will be retried on the next sync.",

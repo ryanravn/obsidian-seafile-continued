@@ -7,6 +7,9 @@ import type { CommitSnapshotChanges, DeletedEntry, FileRevision, HistoryGroup, H
 import { debug } from "../utils";
 import { SnapshotRestoreModal } from "./snapshot_restore_modal";
 import { FileHistoryPanel } from "./file_history_panel";
+import { ConflictResolutionModal } from "./conflict_resolution_modal";
+import { LibraryPolicyModal } from "./library_policy_modal";
+import Dialog from "./dialog_modal";
 import styles from "./history.module.css";
 
 export const HISTORY_VIEW_TYPE = "seafile-sync-history";
@@ -845,11 +848,39 @@ export class HistoryView extends ItemView {
 				text: `${new Date(issue.lastSeenAt).toLocaleString()}${issue.occurrences > 1 ? ` · occurred ${issue.occurrences} times` : ""}`,
 				cls: styles.meta
 			});
-			for (const path of [issue.path, issue.relatedPath].filter((value): value is string => !!value)) {
-				const pathButton = row.createEl("button", { text: path });
+			for (const [label, path] of [["Current", issue.path], ["Related", issue.relatedPath]] as const) {
+				if (!path) continue;
+				const pathButton = row.createEl("button", { text: `${label}: ${path}` });
 				pathButton.addEventListener("click", () => { void this.app.workspace.openLinkText(path, "", false); });
 			}
-			new Setting(row).addButton(button => button
+			const actions = new Setting(row);
+			if (issue.kind === "conflict" && issue.path && issue.relatedPath && !issue.resolved) {
+				actions.addButton(button => button.setButtonText("Review conflict").setCta().onClick(() => {
+					new ConflictResolutionModal(this.plugin, issue, () => { void this.render(); }).open();
+				}));
+			}
+			if (issue.action === "repair-library-policy" && !issue.resolved) {
+				actions.addButton(button => button.setButtonText("Open policy file").setCta().onClick(() => {
+					new LibraryPolicyModal(this.plugin, () => { void this.render(); }).open();
+				}));
+				actions.addButton(button => button.setButtonText("Replace with current settings").setDestructive().onClick(() => {
+					new Dialog(
+						this.app,
+						"Replace library sync policy",
+						"Replace the shared library policy with the synchronization categories currently selected on this device? Other Obsidian Seafile Sync devices will adopt these choices.",
+						async () => {
+							try {
+								await this.plugin.repairLibraryPolicy();
+								new Notice("Library sync policy replaced; synchronization can resume.");
+								await this.render();
+							} catch (error) {
+								new Notice(`Policy could not be replaced: ${(error as Error).message}`, 0);
+							}
+						}
+					).open();
+				}));
+			}
+			actions.addButton(button => button
 				.setButtonText(issue.resolved ? "Reopen" : "Mark resolved")
 				.onClick(() => {
 					this.plugin.issues.resolve(issue.id, !issue.resolved);

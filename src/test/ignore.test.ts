@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "@jest/globals";
 import { DEFAULT_SEAFILE_IGNORE, initConfig } from "../config";
-import { compileIgnoreList, createDefaultIgnoreFile, SEAFILE_IGNORE_FILE } from "../ignore";
+import { compileIgnoreList, createDefaultIgnoreFile, MANAGED_IGNORE_END, MANAGED_IGNORE_START, replaceManagedIgnoreBlock, SEAFILE_IGNORE_FILE, upsertManagedIgnoreBlock } from "../ignore";
+import { DEFAULT_SETTINGS } from "../settings";
 import { MODE_DIR, MODE_FILE, TYPE_FILE, type DirSeafFs, type FileSeafDirent, type FileSeafFs } from "../server";
 import { SyncController } from "../sync/controller";
 import { SyncNode } from "../sync/node";
+import { LIBRARY_POLICY_FILE } from "../sync/library_policy";
 
 const remoteIgnoreContents = "*.tmp\ncache/\n";
 
@@ -40,8 +42,8 @@ function setup(remoteIgnore?: string): SyncController {
 			getAbstractFileByPath: (path: string) => path === "" ? { children: [] } : null,
 		}
 	};
-	initConfig(fakeApp as never, fakeServer as never, "seafile-continued");
-	return new SyncController(adapter, { account: "tester" } as never);
+	initConfig(fakeApp as never, fakeServer as never, "seafile-continued", DEFAULT_SETTINGS);
+	return new SyncController(adapter, { ...DEFAULT_SETTINGS, account: "tester" });
 }
 
 async function bootstrap(sync: SyncController): Promise<void> {
@@ -81,26 +83,98 @@ describe("Seafile ignore patterns", () => {
 
 	test("never excludes the control file itself", () => {
 		expect(compileIgnoreList("*").denies(SEAFILE_IGNORE_FILE, false)).toBe(false);
+		expect(compileIgnoreList("*").denies(LIBRARY_POLICY_FILE, false)).toBe(false);
 	});
 
 	test("generates editable recommended defaults", () => {
 		const defaults = createDefaultIgnoreFile(".obsidian", "seafile-continued");
+		expect(defaults).toContain(MANAGED_IGNORE_START);
+		expect(defaults).toContain(MANAGED_IGNORE_END);
 		expect(defaults).toContain(".git/");
+		expect(defaults).toContain(".vscode/");
 		expect(defaults).toContain("*/.git/");
 		expect(defaults).toContain(".obsidian/workspace.json");
 		expect(defaults).toContain(".obsidian/plugins/seafile-continued/");
 	});
+
+	test("updates only the managed defaults when configuration categories change", () => {
+		const original = `${createDefaultIgnoreFile(".obsidian", "seafile-continued", DEFAULT_SETTINGS)}*.tmp\n`;
+		const updated = replaceManagedIgnoreBlock(original, ".obsidian", "seafile-continued", {
+			...DEFAULT_SETTINGS,
+			syncHotkeys: false,
+			syncCommunityPluginInstallations: false,
+			pluginSyncOverrides: { local: "ignore" }
+		});
+		expect(updated).toContain(".obsidian/hotkeys.json");
+		expect(updated).toContain(".obsidian/plugins/*/main.js");
+		expect(updated).toContain(".obsidian/plugins/local/");
+		expect(updated).toContain("*.tmp\n");
+	});
+
+	test("adds managed defaults to an existing custom file without changing its rules", () => {
+		const updated = upsertManagedIgnoreBlock("*.tmp\ncache/\n", ".obsidian", "seafile-continued", DEFAULT_SETTINGS);
+
+		expect(updated.startsWith(`${MANAGED_IGNORE_START}\n`)).toBe(true);
+		expect(updated).toContain(`\n${MANAGED_IGNORE_END}\n\n*.tmp\ncache/\n`);
+	});
+
+	test("replaces the legacy generated defaults instead of duplicating them", () => {
+		const legacy = "# Git repositories\n.git/\n*/.git/\n\n"
+			+ "# Device-specific Obsidian workspace state\n.obsidian/workspace.json\n.obsidian/workspace-mobile.json\n\n"
+			+ "# Seafile Sync plugin installation and device state\n.obsidian/plugins/seafile-continued/\n";
+		const updated = upsertManagedIgnoreBlock(legacy, ".obsidian", "seafile-improved", DEFAULT_SETTINGS);
+
+		expect(updated.match(new RegExp(MANAGED_IGNORE_START, "g"))).toHaveLength(1);
+		expect(updated).not.toContain("# Git repositories");
+		expect(updated).not.toContain(".obsidian/plugins/seafile-continued/");
+		expect(updated.match(/^\.git\/$/gm)).toHaveLength(1);
+		expect(updated.match(/^\.obsidian\/workspace\.json$/gm)).toHaveLength(1);
+	});
+
+	test("removes legacy defaults left below an existing managed section", () => {
+		const managed = createDefaultIgnoreFile(".obsidian", "seafile-improved", DEFAULT_SETTINGS);
+		const legacy = "# Git repositories\n.git/\n*/.git/\n\n"
+			+ "# Device-specific Obsidian workspace state\n.obsidian/workspace.json\n.obsidian/workspace-mobile.json\n\n"
+			+ "# Seafile Sync plugin installation and device state\n.obsidian/plugins/seafile-continued/\n";
+		const updated = upsertManagedIgnoreBlock(`${managed}${legacy}*.tmp\n`, ".obsidian", "seafile-improved", DEFAULT_SETTINGS);
+
+		expect(updated).not.toContain("# Git repositories");
+		expect(updated).not.toContain(".obsidian/plugins/seafile-continued/");
+		expect(updated).toContain("# Add your own Seafile ignore patterns below this line.\n*.tmp\n");
+	});
+
+	test("renames the legacy managed markers without duplicating the section", () => {
+		const legacyManaged = createDefaultIgnoreFile(".obsidian", "seafile-improved", DEFAULT_SETTINGS)
+			.replace("Obsidian Seafile Sync managed defaults", "Seafile Improved managed defaults")
+			.replace("Obsidian Seafile Sync managed defaults", "Seafile Improved managed defaults");
+		const updated = upsertManagedIgnoreBlock(legacyManaged, ".obsidian", "seafile-improved", DEFAULT_SETTINGS);
+
+		expect(updated.match(new RegExp(MANAGED_IGNORE_START, "g"))).toHaveLength(1);
+		expect(updated).not.toContain("Seafile Improved managed defaults");
+	});
 });
 
 describe("Seafile ignore file lifecycle", () => {
-	test("downloads an existing remote ignore file before traversal", async () => {
+	test("adopts an existing remote ignore file and adds managed defaults before traversal", async () => {
 		const sync = setup(remoteIgnoreContents);
 
 		await bootstrap(sync);
 
-		expect(await global.app.vault.adapter.read(SEAFILE_IGNORE_FILE)).toBe(remoteIgnoreContents);
-		expect((await global.app.vault.adapter.stat(SEAFILE_IGNORE_FILE))?.mtime).toBe(1700000000 * 1000);
+		const contents = await global.app.vault.adapter.read(SEAFILE_IGNORE_FILE);
+		expect(contents.startsWith(`${MANAGED_IGNORE_START}\n`)).toBe(true);
+		expect(contents).toContain(`\n${MANAGED_IGNORE_END}\n\n${remoteIgnoreContents}`);
 		expect(sync.isPathIgnored("notes/cache.tmp", false)).toBe(true);
+	});
+
+	test("adds managed defaults to an existing local ignore file before traversal", async () => {
+		const sync = setup();
+		await global.app.vault.adapter.write(SEAFILE_IGNORE_FILE, "*.local\n");
+
+		await sync.updateManagedIgnoreRules();
+
+		const contents = await global.app.vault.adapter.read(SEAFILE_IGNORE_FILE);
+		expect(contents.startsWith(`${MANAGED_IGNORE_START}\n`)).toBe(true);
+		expect(contents).toContain(`\n${MANAGED_IGNORE_END}\n\n*.local\n`);
 	});
 
 	test("creates the recommended file when neither side has one", async () => {

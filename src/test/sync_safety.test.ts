@@ -5,6 +5,7 @@ import { MODE_DIR, MODE_FILE, TYPE_FILE, type DirSeafDirent, type FileSeafDirent
 import { SyncController, type NodeChange } from "../sync/controller";
 import { SyncNode } from "../sync/node";
 import { debug } from "../utils";
+import { DEFAULT_SETTINGS } from "../settings";
 
 const originalPath = "atomic-note.md";
 
@@ -46,6 +47,9 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	jest.restoreAllMocks();
+	if (await global.app.vault.adapter.exists(".obsidian/plugins/example/cache.json")) {
+		await rm(fullPath(".obsidian/plugins/example/cache.json"));
+	}
 	const listed = await global.app.vault.adapter.list("");
 	for (const path of listed.files.filter(path => path.includes("atomic-note.md"))) {
 		await rm(fullPath(path));
@@ -83,6 +87,31 @@ describe("sync data safety", () => {
 		expect(await global.app.vault.adapter.read(originalPath)).toBe("abcdef");
 		expect((await global.app.vault.adapter.stat(originalPath))?.mtime).toBe(1700000000 * 1000);
 		expect(progress).toEqual([0, 3, 6]);
+	});
+
+	test("does not replace a local file that changes while its remote version downloads", async () => {
+		const adapter = global.app.vault.adapter;
+		await adapter.write(originalPath, "original");
+		const expected = await adapter.stat(originalPath);
+		if (!expected || expected.type !== "file") throw new Error("Expected test file");
+		const sync = setupServer(
+			{ block_ids: ["only"], size: 3, type: TYPE_FILE, version: 1 },
+			{},
+			async () => {
+				await adapter.write(originalPath, "newer local edit");
+				return new TextEncoder().encode("new").buffer;
+			}
+		);
+
+		await expect(sync.downloadFile(
+			originalPath,
+			"fs-id",
+			1700000000,
+			3,
+			undefined,
+			{ size: expected.size, mtime: expected.mtime }
+		)).rejects.toThrow("changed while it was being synchronized");
+		expect(await adapter.read(originalPath)).toBe("newer local edit");
 	});
 
 	test("keeps replacement staging inside the private plugin directory", async () => {
@@ -276,6 +305,96 @@ describe("sync data safety", () => {
 		expect(conflict).toBeDefined();
 		expect(await global.app.vault.adapter.read(conflict!)).toBe("local changes");
 		expect(changes.some(change => change.type === "add" && change.node.path.includes("SFConflict"))).toBe(true);
+	});
+
+	test("automatically merges independent Markdown changes against the synchronized base", async () => {
+		const baseContents = "title\nfirst\nsecond\n";
+		const remoteContents = "title\nfirst\nremote second\n";
+		const blocks = {
+			"base-block": new TextEncoder().encode(baseContents).buffer,
+			"remote-block": new TextEncoder().encode(remoteContents).buffer
+		};
+		const files: Record<string, FileSeafFs> = {
+			"base-fs": { block_ids: ["base-block"], size: baseContents.length, type: TYPE_FILE, version: 1 },
+			"remote-fs": { block_ids: ["remote-block"], size: remoteContents.length, type: TYPE_FILE, version: 1 }
+		};
+		const adapter = global.app.vault.adapter;
+		const fakeServer = {
+			crypto: null,
+			getFs: async (id: string) => [id, files[id]],
+			getBlock: async (id: keyof typeof blocks) => blocks[id]
+		};
+		const fakeApp = { vault: { configDir: ".obsidian", adapter, getAbstractFileByPath: () => null } };
+		const settings = { ...DEFAULT_SETTINGS, account: "person@example.com" };
+		initConfig(fakeApp as never, fakeServer as never, "seafile", settings);
+		const sync = new SyncController(adapter, settings);
+		await adapter.write(originalPath, "local title\nfirst\nsecond\n", { mtime: 1700000100 * 1000 });
+		const previous: FileSeafDirent = {
+			id: "base-fs", mode: MODE_FILE, modifier: "person@example.com", mtime: 1700000000,
+			name: originalPath, size: baseContents.length
+		};
+		const remote: FileSeafDirent = {
+			id: "remote-fs", mode: MODE_FILE, modifier: "other@example.com", mtime: 1700000200,
+			name: originalPath, size: remoteContents.length
+		};
+		const root = await SyncNode.deserialize("", { prev: null, children: { [originalPath]: { prev: previous, children: {} } } });
+		const changes: NodeChange[] = [];
+
+		await sync.pull(changes, `/${originalPath}`, root.getChildren()[originalPath], remote);
+
+		expect(await adapter.read(originalPath)).toBe("local title\nfirst\nremote second\n");
+		expect(changes).toHaveLength(1);
+		expect(changes[0]).toMatchObject({ type: "modify" });
+		expect((await adapter.list("")).files.some(path => path.includes("SFConflict"))).toBe(false);
+	});
+
+	test("retains excluded remote plugin data and downloads it after the policy is enabled", async () => {
+		const path = ".obsidian/plugins/example/cache.json";
+		const contents = "{\"cached\":true}";
+		const bytes = new TextEncoder().encode(contents);
+		const fs: FileSeafFs = { block_ids: ["cache-block"], size: bytes.byteLength, type: TYPE_FILE, version: 1 };
+		const adapter = global.app.vault.adapter;
+		const fakeServer = {
+			crypto: null,
+			getFs: async () => ["cache-fs", fs],
+			getBlock: async () => bytes.buffer
+		};
+		const fakeApp = { vault: { configDir: ".obsidian", adapter, getAbstractFileByPath: () => null } };
+		const settings = { ...DEFAULT_SETTINGS, account: "person@example.com", syncAdditionalPluginData: false };
+		initConfig(fakeApp as never, fakeServer as never, "seafile", settings);
+		const sync = new SyncController(adapter, settings);
+		await adapter.mkdir(".obsidian/plugins/example");
+		const remote: FileSeafDirent = {
+			id: "cache-fs", mode: MODE_FILE, modifier: "other@example.com", mtime: 1700000200,
+			name: "cache.json", size: bytes.byteLength
+		};
+		const root = await SyncNode.deserialize("", { prev: null, children: { cache: { prev: null, children: {} } } });
+		const node = root.getChildren().cache;
+
+		await sync.pull([], `/${path}`, node, remote);
+		expect(await adapter.exists(path)).toBe(false);
+		expect(node.policyExcluded).toBe(true);
+		expect(node.prev?.id).toBe("cache-fs");
+
+		settings.syncAdditionalPluginData = true;
+		await sync.libraryPolicySettingsChanged();
+		await sync.pull([], `/${path}`, node, remote);
+		expect(await adapter.read(path)).toBe(contents);
+		expect(node.policyExcluded).toBe(false);
+	});
+
+	test("persists policy-excluded baselines across sync index serialization", async () => {
+		setupServer({ block_ids: [], size: 0, type: TYPE_FILE, version: 1 }, {});
+		const remote: FileSeafDirent = {
+			id: "excluded-fs", mode: MODE_FILE, modifier: "other@example.com", mtime: 1700000200,
+			name: "cache.json", size: 0
+		};
+		const root = await SyncNode.deserialize("", { prev: null, children: { cache: { prev: remote, children: {} } } });
+		await root.getChildren().cache.setPolicyExcludedAsync(true);
+
+		const restored = await SyncNode.deserialize("", SyncNode.serialize(root));
+		expect(restored.getChildren().cache.policyExcluded).toBe(true);
+		expect(restored.getChildren().cache.prev?.id).toBe("excluded-fs");
 	});
 
 	test("clears a stale pending root when reconciliation finds identical content", async () => {

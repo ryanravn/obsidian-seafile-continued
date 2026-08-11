@@ -3,10 +3,19 @@ import { App, DataAdapter, DataWriteOptions, ListedFiles, RequestUrlParam, Reque
 import { PlatformPath } from 'path/posix';
 export const Path = (require("path-browserify").posix) as PlatformPath;
 
+export function normalizePath(path: string): string {
+    const normalized = Path.normalize(path.replace(/\\/g, "/"));
+    return normalized === "." ? "" : normalized.replace(/^\.\//, "");
+}
+
 export const Platform = {
     isDesktop: true,
     isMobile: false,
 };
+
+const yaml = require("js-yaml") as { load: (value: string) => unknown, dump: (value: unknown, options?: unknown) => string };
+export const parseYaml = (value: string): unknown => yaml.load(value);
+export const stringifyYaml = (value: unknown): string => yaml.dump(value, { noRefs: true, lineWidth: -1 });
 
 export class Notice {
     constructor(_message: string, _timeout?: number) {}
@@ -144,8 +153,11 @@ class MockDataAdapter extends FileSystemAdapter implements DataAdapter {
             await this.updateModificationTime(normalizedPath, new Date(options.mtime));
         }
     }
-    process(normalizedPath: string, fn: (data: string) => string, options?: DataWriteOptions | undefined): Promise<string> {
-        throw new Error('Method not implemented.');
+    async process(normalizedPath: string, fn: (data: string) => string, options?: DataWriteOptions | undefined): Promise<string> {
+        const current = await this.read(normalizedPath);
+        const updated = fn(current);
+        await this.write(normalizedPath, updated, options);
+        return updated;
     }
     getResourcePath(normalizedPath: string): string {
         throw new Error('Method not implemented.');
