@@ -514,14 +514,47 @@
 .conflictPath {
 	font-family: var(--font-monospace);
 	font-size: var(--font-ui-smaller);
-	margin: 0.1rem 0 0.6rem;
+	margin: 0.25rem 0;
 	overflow-wrap: anywhere;
+}
+
+.conflictExplanation {
+	background: var(--background-secondary);
+	border-left: 3px solid var(--interactive-accent);
+	border-radius: var(--radius-s);
+	font-size: var(--font-ui-small);
+	margin-bottom: 0.75rem;
+	padding: 0.65rem 0.75rem;
+}
+
+.conflictVersions {
+	display: grid;
+	gap: 0.6rem;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.conflictVersion {
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	min-width: 0;
+	padding: 0.65rem;
+}
+
+.conflictVersionDescription {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	margin-top: 0.2rem;
+}
+
+.conflictComparisonTitle {
+	display: block;
+	margin-top: 0.9rem;
 }
 
 .conflictSummary {
 	color: var(--text-muted);
 	font-size: var(--font-ui-smaller);
-	margin: 0.75rem 0 0.35rem;
+	margin: 0.2rem 0 0.35rem;
 }
 
 .conflictDiff {
@@ -536,6 +569,18 @@
 .conflictActions {
 	border-top: 0;
 	margin-top: 0.5rem;
+}
+
+.conflictActionHelp {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	margin-top: 0.7rem;
+}
+
+@media (max-width: 600px) {
+	.conflictVersions {
+		grid-template-columns: minmax(0, 1fr);
+	}
 }
 
 .danger {

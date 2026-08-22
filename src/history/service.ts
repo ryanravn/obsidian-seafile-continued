@@ -33,6 +33,7 @@ export interface FileMetadataRevisionScan {
 }
 
 const DELETED_HISTORY_SCAN_LIMIT = 50;
+const SNAPSHOT_COMPARE_CONCURRENCY = 4;
 
 export class HistoryService {
 	constructor(private readonly server: Server) {}
@@ -196,6 +197,7 @@ export class HistoryService {
 			addedFiles: [], modifiedFiles: [], modifiedFileChanges: [], deletedFiles: [], addedDirectories: [], deletedDirectories: []
 		};
 		await this.compareDirectory("", currentRoot.id, targetRoot.id, diff);
+		this.sortSnapshotDiff(diff);
 		return diff;
 	}
 
@@ -210,6 +212,7 @@ export class HistoryService {
 			addedFiles: [], modifiedFiles: [], modifiedFileChanges: [], deletedFiles: [], addedDirectories: [], deletedDirectories: []
 		};
 		await this.compareDirectory("", parentRoot?.id ?? null, commitRoot.id, diff);
+		this.sortSnapshotDiff(diff);
 		return {
 			commitId,
 			parentCommitId,
@@ -333,36 +336,76 @@ export class HistoryService {
 	}
 
 	private async compareDirectory(path: string, currentId: string | null, targetId: string | null, diff: SnapshotDiff): Promise<void> {
-		if (currentId === targetId) return;
-		const [current, target] = await Promise.all([
-			currentId ? this.readDirectory(currentId) : Promise.resolve<DirSeafFs>({ type: TYPE_DIR, version: 1, dirents: [] }),
-			targetId ? this.readDirectory(targetId) : Promise.resolve<DirSeafFs>({ type: TYPE_DIR, version: 1, dirents: [] })
-		]);
-		const currentByName = new Map(current.dirents.map(entry => [entry.name, entry]));
-		const targetByName = new Map(target.dirents.map(entry => [entry.name, entry]));
-		const names = new Set([...currentByName.keys(), ...targetByName.keys()]);
-		for (const name of names) {
-			const before = currentByName.get(name);
-			const after = targetByName.get(name);
-			const childPath = `${path}/${name}`;
-			if (!before && after) {
-				await this.collectAdded(childPath, after, diff);
-			} else if (before && !after) {
-				await this.collectDeleted(childPath, before, diff);
-			} else if (before && after && before.mode !== after.mode) {
-				await this.collectDeleted(childPath, before, diff);
-				await this.collectAdded(childPath, after, diff);
-			} else if (before?.mode === MODE_DIR && after?.mode === MODE_DIR) {
-				await this.compareDirectory(childPath, before.id, after.id, diff);
-			} else if (before?.mode === MODE_FILE && after?.mode === MODE_FILE) {
-				const metadataChanges = this.fileMetadataChanges(before, after);
-				const contentChanged = before.id !== after.id;
-				if (contentChanged || metadataChanges.length > 0) {
-					diff.modifiedFiles.push(childPath);
-					diff.modifiedFileChanges.push({ path: childPath, kind: "modified", contentChanged, metadataChanges });
+		type CompareTask =
+			| { kind: "compare", path: string, currentId: string | null, targetId: string | null }
+			| { kind: "add" | "delete", path: string, entry: SeafDirent };
+		let tasks: CompareTask[] = [{ kind: "compare", path, currentId, targetId }];
+		while (tasks.length > 0) {
+			const nextTasks: CompareTask[] = [];
+			let next = 0;
+			const worker = async (): Promise<void> => {
+				while (next < tasks.length) {
+					const task = tasks[next++];
+					if (task.kind !== "compare") {
+						const added = task.kind === "add";
+						if (task.entry.mode === MODE_FILE) {
+							(added ? diff.addedFiles : diff.deletedFiles).push(task.path);
+							continue;
+						}
+						(added ? diff.addedDirectories : diff.deletedDirectories).push(task.path);
+						const directory = await this.readDirectory(task.entry.id);
+						for (const child of directory.dirents) nextTasks.push({
+							kind: task.kind,
+							path: `${task.path}/${child.name}`,
+							entry: child
+						});
+						continue;
+					}
+					if (task.currentId === task.targetId) continue;
+					const [current, target] = await Promise.all([
+						task.currentId ? this.readDirectory(task.currentId) : Promise.resolve<DirSeafFs>({ type: TYPE_DIR, version: 1, dirents: [] }),
+						task.targetId ? this.readDirectory(task.targetId) : Promise.resolve<DirSeafFs>({ type: TYPE_DIR, version: 1, dirents: [] })
+					]);
+					const currentByName = new Map(current.dirents.map(entry => [entry.name, entry]));
+					const targetByName = new Map(target.dirents.map(entry => [entry.name, entry]));
+					const names = new Set([...currentByName.keys(), ...targetByName.keys()]);
+					for (const name of names) {
+						const before = currentByName.get(name);
+						const after = targetByName.get(name);
+						const childPath = `${task.path}/${name}`;
+						if (!before && after) nextTasks.push({ kind: "add", path: childPath, entry: after });
+						else if (before && !after) nextTasks.push({ kind: "delete", path: childPath, entry: before });
+						else if (before && after && before.mode !== after.mode) {
+							nextTasks.push({ kind: "delete", path: childPath, entry: before });
+							nextTasks.push({ kind: "add", path: childPath, entry: after });
+						} else if (before?.mode === MODE_DIR && after?.mode === MODE_DIR) {
+							nextTasks.push({ kind: "compare", path: childPath, currentId: before.id, targetId: after.id });
+						} else if (before?.mode === MODE_FILE && after?.mode === MODE_FILE) {
+							const metadataChanges = this.fileMetadataChanges(before, after);
+							const contentChanged = before.id !== after.id;
+							if (contentChanged || metadataChanges.length > 0) {
+								diff.modifiedFiles.push(childPath);
+								diff.modifiedFileChanges.push({ path: childPath, kind: "modified", contentChanged, metadataChanges });
+							}
+						}
+					}
 				}
-			}
+			};
+			await Promise.all(Array.from(
+				{ length: Math.min(SNAPSHOT_COMPARE_CONCURRENCY, tasks.length) },
+				async () => await worker()
+			));
+			tasks = nextTasks;
 		}
+	}
+
+	private sortSnapshotDiff(diff: SnapshotDiff): void {
+		diff.addedFiles.sort((left, right) => left.localeCompare(right));
+		diff.modifiedFiles.sort((left, right) => left.localeCompare(right));
+		diff.modifiedFileChanges.sort((left, right) => left.path.localeCompare(right.path));
+		diff.deletedFiles.sort((left, right) => left.localeCompare(right));
+		diff.addedDirectories.sort((left, right) => left.localeCompare(right));
+		diff.deletedDirectories.sort((left, right) => left.localeCompare(right));
 	}
 
 	private fileMetadataChanges(before: FileSeafDirent, after: FileSeafDirent): FileMetadataChange[] {
@@ -373,21 +416,4 @@ export class HistoryService {
 		return changes;
 	}
 
-	private async collectAdded(path: string, entry: SeafDirent, diff: SnapshotDiff): Promise<void> {
-		if (entry.mode === MODE_FILE) {
-			diff.addedFiles.push(path);
-			return;
-		}
-		diff.addedDirectories.push(path);
-		for (const child of (await this.readDirectory(entry.id)).dirents) await this.collectAdded(`${path}/${child.name}`, child, diff);
-	}
-
-	private async collectDeleted(path: string, entry: SeafDirent, diff: SnapshotDiff): Promise<void> {
-		if (entry.mode === MODE_FILE) {
-			diff.deletedFiles.push(path);
-			return;
-		}
-		diff.deletedDirectories.push(path);
-		for (const child of (await this.readDirectory(entry.id)).dirents) await this.collectDeleted(`${path}/${child.name}`, child, diff);
-	}
 }

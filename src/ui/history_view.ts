@@ -37,6 +37,11 @@ export class HistoryView extends ItemView {
 	private filePanel: FileHistoryPanel | null = null;
 	private readonly snapshotChanges = new Map<string, Promise<CommitSnapshotChanges>>();
 	private renderGeneration = 0;
+	private activityFilterGeneration = 0;
+	private activitySearchTimer: number | undefined;
+	private readonly openActivityGroups = new Set<string>();
+	private readonly relativeTimeFormatter = new Intl.RelativeTimeFormat(undefined, { numeric: "auto", style: "short" });
+	private static readonly SNAPSHOT_CHANGE_CACHE_LIMIT = 75;
 
 	constructor(leaf: WorkspaceLeaf, private readonly plugin: SeafilePlugin) {
 		super(leaf);
@@ -51,8 +56,10 @@ export class HistoryView extends ItemView {
 	}
 
 	async onClose(): Promise<void> {
+		if (this.activitySearchTimer !== undefined) window.clearTimeout(this.activitySearchTimer);
 		this.filePanel?.dispose();
 		this.filePanel = null;
+		this.snapshotChanges.clear();
 	}
 
 	async showTab(tab: HistoryTab): Promise<void> {
@@ -70,6 +77,11 @@ export class HistoryView extends ItemView {
 
 	private async render(): Promise<void> {
 		const generation = ++this.renderGeneration;
+		this.activityFilterGeneration++;
+		if (this.activitySearchTimer !== undefined) {
+			window.clearTimeout(this.activitySearchTimer);
+			this.activitySearchTimer = undefined;
+		}
 		this.filePanel?.dispose();
 		this.filePanel = null;
 		const container = this.containerEl.children[1] as HTMLElement;
@@ -113,14 +125,24 @@ export class HistoryView extends ItemView {
 	private async renderActivity(container: HTMLElement, generation: number): Promise<void> {
 		if (this.revisions.length === 0) await this.loadHistory(true);
 		if (generation !== this.renderGeneration) return;
-		new Setting(container)
+		const results = container.createDiv();
+		const refreshResults = (): void => {
+			const filterGeneration = ++this.activityFilterGeneration;
+			results.empty();
+			void this.renderActivityResults(results, generation, filterGeneration);
+		};
+		const controls = new Setting(container)
 			.setName("Filter history")
 			.addSearch(search => search
 				.setPlaceholder("File, author, device, or description")
 				.setValue(this.search)
 				.onChange(value => {
 					this.search = value.toLowerCase();
-					void this.render();
+					if (this.activitySearchTimer !== undefined) window.clearTimeout(this.activitySearchTimer);
+					this.activitySearchTimer = window.setTimeout(() => {
+						this.activitySearchTimer = undefined;
+						refreshResults();
+					}, 180);
 				}))
 			.addButton(button => {
 				const updateButton = (): void => {
@@ -133,9 +155,15 @@ export class HistoryView extends ItemView {
 				updateButton();
 				button.onClick(() => {
 					this.showActivityMetadataOnly = !this.showActivityMetadataOnly;
-					void this.render();
+					updateButton();
+					refreshResults();
 				});
 			});
+		controls.settingEl.after(results);
+		refreshResults();
+	}
+
+	private async renderActivityResults(container: HTMLElement, generation: number, filterGeneration: number): Promise<void> {
 		let groups = groupHistory(this.revisions, this.plugin.settings.historyGroupingMinutes)
 			.filter(group => !this.search || JSON.stringify(group).toLowerCase().includes(this.search));
 		if (!this.showActivityMetadataOnly && groups.length > 0) {
@@ -144,8 +172,9 @@ export class HistoryView extends ItemView {
 				status.setText(`Filtering revisions ${completed}/${total}`);
 			});
 			status.remove();
-			if (generation !== this.renderGeneration) return;
+			if (generation !== this.renderGeneration || filterGeneration !== this.activityFilterGeneration) return;
 		}
+		if (generation !== this.renderGeneration || filterGeneration !== this.activityFilterGeneration) return;
 		if (groups.length === 0) {
 			container.createDiv({
 				text: this.showActivityMetadataOnly ? "No matching activity" : "No matching content-changing activity",
@@ -193,10 +222,20 @@ export class HistoryView extends ItemView {
 			const body = element.createDiv({ cls: styles.commitBody });
 			let loaded = false;
 			element.addEventListener("toggle", () => {
-				if (!element.open || loaded) return;
+				if (!element.open) {
+					this.openActivityGroups.delete(group.id);
+					return;
+				}
+				this.openActivityGroups.add(group.id);
+				if (loaded) return;
 				loaded = true;
 				void this.renderActivityDetails(body, group);
 			});
+			if (this.openActivityGroups.has(group.id)) {
+				element.open = true;
+				loaded = true;
+				void this.renderActivityDetails(body, group);
+			}
 		}
 		if (this.more) new Setting(container).addButton(button => button.setButtonText("Load older activity").onClick(async () => {
 			button.setDisabled(true);
@@ -484,10 +523,20 @@ export class HistoryView extends ItemView {
 
 	private getSnapshotChanges(revision: LibraryRevision): Promise<CommitSnapshotChanges> {
 		let request = this.snapshotChanges.get(revision.commitId);
-		if (!request) {
+		if (request) {
+			this.snapshotChanges.delete(revision.commitId);
+			this.snapshotChanges.set(revision.commitId, request);
+		} else {
 			request = this.plugin.history.compareCommitToParent(revision.commitId);
 			this.snapshotChanges.set(revision.commitId, request);
-			void request.catch(() => this.snapshotChanges.delete(revision.commitId));
+			while (this.snapshotChanges.size > HistoryView.SNAPSHOT_CHANGE_CACHE_LIMIT) {
+				const oldest = this.snapshotChanges.keys().next().value as string | undefined;
+				if (!oldest) break;
+				this.snapshotChanges.delete(oldest);
+			}
+			void request.catch(() => {
+				if (this.snapshotChanges.get(revision.commitId) === request) this.snapshotChanges.delete(revision.commitId);
+			});
 		}
 		return request;
 	}
@@ -618,7 +667,6 @@ export class HistoryView extends ItemView {
 
 	private relativeTime(timestamp: number): string {
 		const delta = timestamp - Date.now();
-		const formatter = new Intl.RelativeTimeFormat(undefined, { numeric: "auto", style: "short" });
 		const units: Array<[Intl.RelativeTimeFormatUnit, number]> = [
 			["year", 365 * 24 * 60 * 60 * 1000],
 			["month", 30 * 24 * 60 * 60 * 1000],
@@ -627,7 +675,7 @@ export class HistoryView extends ItemView {
 			["minute", 60 * 1000]
 		];
 		for (const [unit, milliseconds] of units) {
-			if (Math.abs(delta) >= milliseconds || unit === "minute") return formatter.format(Math.round(delta / milliseconds), unit);
+			if (Math.abs(delta) >= milliseconds || unit === "minute") return this.relativeTimeFormatter.format(Math.round(delta / milliseconds), unit);
 		}
 		return "now";
 	}

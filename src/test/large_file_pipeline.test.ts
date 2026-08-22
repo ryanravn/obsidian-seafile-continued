@@ -23,6 +23,7 @@ function setup(options: {
 	storeFs?: boolean
 	publishedHead?: string
 	uploadDelayMs?: number
+	uploadBarrier?: number
 	encryptionDelayMs?: number
 	fsOperationDelayMs?: number
 } = {}) {
@@ -40,10 +41,22 @@ function setup(options: {
 	const storedIds = new Set<string>();
 	const uploadAttempts = new Map<string, number>();
 	const storedFs = new Set<string>();
+	let releaseUploadBarrier = (): void => {};
+	const uploadBarrier = new Promise<void>(resolve => { releaseUploadBarrier = resolve; });
 	const checkBlocksList = jest.fn(async (ids: string[]) => new Map(ids.map(id => [id, !storedIds.has(id)])));
 	const uploadBlock = jest.fn(async (id: string) => {
 		activeUploads++;
 		maximumActiveUploads = Math.max(maximumActiveUploads, activeUploads);
+		if (activeUploads >= (options.uploadBarrier ?? Number.POSITIVE_INFINITY)) releaseUploadBarrier();
+		if (options.uploadBarrier !== undefined) {
+			await new Promise<void>(resolve => {
+				const timeout = setTimeout(resolve, 250);
+				void uploadBarrier.then(() => {
+					clearTimeout(timeout);
+					resolve();
+				});
+			});
+		}
 		await new Promise(resolve => setTimeout(resolve, options.uploadDelayMs ?? 5));
 		uploadedIds.push(id);
 		const attempts = (uploadAttempts.get(id) ?? 0) + 1;
@@ -154,7 +167,7 @@ beforeEach(async () => {
 
 describe("bounded large-file upload pipeline", () => {
 	test("reads desktop files in ranges and uploads missing blocks with bounded concurrency", async () => {
-		const { adapter, sync, checkBlocksList, uploadedIds, getMaximumActiveUploads } = setup({ uploadDelayMs: 30 });
+		const { adapter, sync, checkBlocksList, uploadedIds, getMaximumActiveUploads } = setup({ uploadBarrier: 3 });
 		await adapter.writeBinary(testPath, makeContents());
 		const readBinary = jest.spyOn(adapter, "readBinary");
 

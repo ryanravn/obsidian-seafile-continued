@@ -220,6 +220,41 @@ describe("historical content and snapshots", () => {
 		expect(server.getFs).not.toHaveBeenCalledWith("same-dir");
 	});
 
+	test("compares independent snapshot directories with bounded concurrency", async () => {
+		const roots: Record<string, DirSeafDirent> = {
+			current: { id: "current-root", mode: MODE_DIR, mtime: 1, name: "" },
+			target: { id: "target-root", mode: MODE_DIR, mtime: 1, name: "" }
+		};
+		const directory = (prefix: string): SeafFsResult => [prefix, {
+			type: TYPE_DIR,
+			version: 1,
+			dirents: Array.from({ length: 6 }, (_, index) => ({
+				id: `${prefix}-${index}`,
+				mode: MODE_DIR,
+				mtime: 1,
+				name: `folder-${index}`
+			}))
+		}];
+		let active = 0;
+		let maximumActive = 0;
+		const server = {
+			getCommitRoot: jest.fn(async (id: string) => roots[id]),
+			getFs: jest.fn(async (id: string): Promise<SeafFsResult> => {
+				active++;
+				maximumActive = Math.max(maximumActive, active);
+				await new Promise(resolve => setTimeout(resolve, 5));
+				active--;
+				if (id === "current-root" || id === "target-root") return directory(id);
+				return [id, { type: TYPE_DIR, version: 1, dirents: [] }];
+			})
+		};
+
+		await new HistoryService(server as never).compareSnapshots("current", "target");
+
+		expect(maximumActive).toBeGreaterThan(2);
+		expect(maximumActive).toBeLessThanOrEqual(8);
+	});
+
 	test("builds file-history entries only for metadata-only revisions", async () => {
 		const roots: Record<string, DirSeafDirent> = {
 			parent: { id: "parent-root", mode: MODE_DIR, mtime: 1, name: "" },

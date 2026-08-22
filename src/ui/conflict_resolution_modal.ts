@@ -38,10 +38,14 @@ export class ConflictResolutionModal extends Modal {
 				this.plugin.app.vault.adapter.stat(currentPath),
 				this.plugin.app.vault.adapter.stat(conflictPath)
 			]);
-			const [currentContent, conflictContent] = await Promise.all([
+			const limit = historyTextDiffLimit(currentPath);
+			const loadComparison = limit !== null
+				&& (current?.size ?? 0) <= limit
+				&& (conflict?.size ?? 0) <= limit;
+			const [currentContent, conflictContent] = loadComparison ? await Promise.all([
 				current?.type === "file" ? this.plugin.app.vault.adapter.readBinary(currentPath) : undefined,
 				conflict?.type === "file" ? this.plugin.app.vault.adapter.readBinary(conflictPath) : undefined
-			]);
+			]) : [undefined, undefined];
 			this.reviewed = { current, conflict, currentContent, conflictContent };
 			this.renderReview();
 		} catch (error) {
@@ -53,38 +57,75 @@ export class ConflictResolutionModal extends Modal {
 	private renderReview(): void {
 		if (!this.reviewed) return;
 		this.contentEl.empty();
-		this.contentEl.createDiv({ text: "Current library version", cls: styles.meta });
-		this.contentEl.createDiv({ text: this.issue.path ?? "Unavailable", cls: styles.conflictPath });
-		this.contentEl.createDiv({ text: "Preserved local version", cls: styles.meta });
-		this.contentEl.createDiv({ text: this.issue.relatedPath ?? "Unavailable", cls: styles.conflictPath });
+		this.contentEl.createDiv({
+			text: "Sync downloaded the Seafile version to the original path and saved this device's pre-sync version as a separate file. Compare them before choosing what remains at the original path.",
+			cls: styles.conflictExplanation
+		});
+		const versions = this.contentEl.createDiv({ cls: styles.conflictVersions });
+		this.renderVersion(
+			versions,
+			"CURRENT · Downloaded from Seafile",
+			"This is now at the original path.",
+			this.issue.path ?? "Unavailable",
+			this.reviewed.current
+		);
+		this.renderVersion(
+			versions,
+			"LOCAL · Preserved from this device",
+			"This is the file as it was here before the conflicting sync.",
+			this.issue.relatedPath ?? "Unavailable",
+			this.reviewed.conflict
+		);
 		this.renderComparison();
 
+		this.contentEl.createDiv({
+			text: "Keeping either single version removes the separate conflict copy. Keeping both files leaves CURRENT at the original path and LOCAL under its conflict filename.",
+			cls: styles.conflictActionHelp
+		});
 		const actions = new Setting(this.contentEl).setClass(styles.conflictActions);
 		actions.addButton(button => button
-			.setButtonText("Use current")
-			.setTooltip("Keep the current library version and remove the preserved local copy")
-			.setDestructive()
+			.setButtonText("Keep downloaded version")
+			.setTooltip("Keep CURRENT at the original path and delete the preserved LOCAL copy")
 			.onClick(() => { void this.resolve("current"); }));
 		actions.addButton(button => button
-			.setButtonText("Use preserved local")
-			.setTooltip("Replace the current file with the preserved local version")
-			.setCta()
+			.setButtonText("Restore my local version")
+			.setTooltip("Replace CURRENT at the original path with LOCAL, then delete the separate conflict copy")
 			.onClick(() => { void this.resolve("conflict"); }));
 		actions.addButton(button => button
-			.setButtonText("Keep both")
+			.setButtonText("Keep both files")
 			.setTooltip("Leave both files unchanged and mark the issue resolved")
 			.onClick(() => { void this.resolve("both"); }));
+	}
+
+	private renderVersion(
+		container: HTMLElement,
+		title: string,
+		description: string,
+		path: string,
+		stat: Stat | null
+	): void {
+		const card = container.createDiv({ cls: styles.conflictVersion });
+		card.createEl("strong", { text: title });
+		card.createDiv({ text: description, cls: styles.conflictVersionDescription });
+		card.createDiv({ text: path, cls: styles.conflictPath });
+		if (stat?.type === "file") {
+			card.createDiv({
+				text: `${stat.size.toLocaleString()} bytes · modified ${new Date(stat.mtime).toLocaleString()}`,
+				cls: styles.meta
+			});
+		}
 	}
 
 	private renderComparison(): void {
 		if (!this.reviewed) return;
 		const { current, conflict, currentContent, conflictContent } = this.reviewed;
-		if (!conflictContent) {
+		if (conflict?.type !== "file") {
 			this.contentEl.createDiv({ text: "The preserved local copy no longer exists.", cls: styles.danger });
 			return;
 		}
 		const limit = historyTextDiffLimit(this.issue.path ?? "");
 		const canDiff = limit !== null
+			&& conflictContent !== undefined
 			&& (currentContent?.byteLength ?? 0) <= limit
 			&& conflictContent.byteLength <= limit
 			&& (!currentContent || isLikelyTextContent(currentContent))
@@ -100,13 +141,14 @@ export class ConflictResolutionModal extends Modal {
 		const currentText = formatHistoryText(this.issue.path ?? "", currentContent ? decoder.decode(currentContent) : "");
 		const conflictText = formatHistoryText(this.issue.path ?? "", decoder.decode(conflictContent));
 		const comparison = createLineDiffResult(currentText, conflictText);
+		this.contentEl.createEl("strong", { text: "Line-by-line comparison", cls: styles.conflictComparisonTitle });
 		this.contentEl.createDiv({
-			text: `Preserved local changes · +${comparison.additions ?? 0} −${comparison.deletions ?? 0}`,
+			text: `Compared with CURRENT, LOCAL has ${comparison.additions ?? 0} added line${comparison.additions === 1 ? "" : "s"} and ${comparison.deletions ?? 0} removed line${comparison.deletions === 1 ? "" : "s"}. Labels on each line show which version contains it.`,
 			cls: styles.conflictSummary
 		});
 		const diff = this.contentEl.createDiv({ cls: `${styles.diff} ${styles.conflictDiff}` });
 		for (const run of groupDiffLines(compactLineDiff(comparison.lines))) {
-			const prefix = run.type === "add" ? "+ " : run.type === "remove" ? "− " : "  ";
+			const prefix = run.type === "add" ? "LOCAL   + " : run.type === "remove" ? "CURRENT − " : "BOTH      ";
 			diff.createDiv({
 				text: run.lines.map(line => prefix + line).join("\n"),
 				cls: run.type === "add" ? styles.added : run.type === "remove" ? styles.removed : undefined
@@ -118,6 +160,10 @@ export class ConflictResolutionModal extends Modal {
 		if (!this.reviewed) return;
 		for (const button of Array.from(this.contentEl.querySelectorAll("button"))) button.disabled = true;
 		try {
+			if (resolution === "conflict" && !this.reviewed.conflictContent) {
+				const conflictPath = this.issue.relatedPath ?? "";
+				this.reviewed.conflictContent = await this.plugin.app.vault.adapter.readBinary(conflictPath);
+			}
 			await this.plugin.resolveSyncConflict(this.issue, resolution, this.reviewed);
 			new Notice(resolution === "both" ? "Conflict marked resolved; both files were kept." : "Conflict resolved and synchronization scheduled.");
 			this.onResolved();

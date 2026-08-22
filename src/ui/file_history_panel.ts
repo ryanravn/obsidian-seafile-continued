@@ -16,11 +16,14 @@ type MetadataScanState = "idle" | "scanning" | "complete";
 type RemoteRevisionKind = "created" | "modified" | "renamed" | "deleted" | "unknown";
 
 export class FileHistoryPanel {
+	private static readonly CONTENT_CACHE_LIMIT_BYTES = 32 * 1024 * 1024;
 	private selections: HistorySelection[] = [];
 	private selected: HistorySelection | null = null;
 	private comparisonMode: "previous" | "current" = "previous";
 	private readonly contentCache = new Map<string, ArrayBuffer>();
+	private contentCacheBytes = 0;
 	private readonly versionEntries = new Map<string, HTMLElement>();
+	private readonly versionButtons = new Map<string, HTMLButtonElement>();
 	private readonly remoteRevisionKinds = new Map<string, RemoteRevisionKind>();
 	private nextCommit: string | null = null;
 	private previewEl: HTMLElement;
@@ -39,6 +42,8 @@ export class FileHistoryPanel {
 	private metadataScanPhase = "";
 	private metadataScanProgressEl: HTMLElement | null = null;
 	private showMetadataRevisions = true;
+	private selectionGeneration = 0;
+	private readonly relativeTimeFormatter = new Intl.RelativeTimeFormat(undefined, { numeric: "auto", style: "short" });
 
 	constructor(
 		private readonly plugin: SeafilePlugin,
@@ -59,8 +64,11 @@ export class FileHistoryPanel {
 	}
 
 	dispose(): void {
+		this.selectionGeneration++;
 		this.metadataScanCancelled = true;
 		this.revokeObjectUrl();
+		this.contentCache.clear();
+		this.contentCacheBytes = 0;
 	}
 
 	private revokeObjectUrl(): void {
@@ -71,40 +79,27 @@ export class FileHistoryPanel {
 	private async loadInitial(): Promise<void> {
 		try {
 			const remotePath = "/" + this.path.replace(/^\/+/, "");
-			if (this.seededRevision?.deleted) {
-				const local = await this.plugin.checkpoints.list(this.path);
-				this.selections = this.sortSelections([
-					{ source: "remote", revision: this.seededRevision },
-					...local.map(checkpoint => ({ source: "local" as const, checkpoint }))
-				]);
-				this.remoteLoading = true;
-				this.renderTimeline();
-				if (this.selections[0]) await this.select(this.selections[0]);
-				const remote = await this.loadRemoteHistory(remotePath);
-				this.remoteLoading = false;
-				this.nextCommit = remote.nextCommit;
-				this.selections = this.sortSelections([
-					...this.selections,
-					...remote.revisions.map(revision => ({ source: "remote" as const, revision }))
-				]);
-				await this.classifyRemoteRevisions();
-				this.renderTimeline();
-				return;
-			}
-			const [local, remote] = await Promise.all([
-				this.plugin.checkpoints.list(this.path),
-				this.loadRemoteHistory(remotePath)
-			]);
-			this.nextCommit = remote.nextCommit;
+			const local = await this.plugin.checkpoints.list(this.path);
 			this.selections = this.sortSelections([
 				...(this.seededRevision ? [{ source: "remote" as const, revision: this.seededRevision }] : []),
-				...remote.revisions.map(revision => ({ source: "remote" as const, revision })),
 				...local.map(checkpoint => ({ source: "local" as const, checkpoint }))
 			]);
-			await this.classifyRemoteRevisions();
+			this.remoteLoading = true;
 			this.renderTimeline();
-			if (this.selections[0]) await this.select(this.selections[0]);
+			if (this.selections[0]) void this.select(this.selections[0]);
+
+			const remote = await this.loadRemoteHistory(remotePath);
+			this.remoteLoading = false;
+			this.nextCommit = remote.nextCommit;
+			this.selections = this.sortSelections([
+				...this.selections,
+				...remote.revisions.map(revision => ({ source: "remote" as const, revision }))
+			]);
+			this.classifyRemoteRevisions();
+			this.renderTimeline();
+			if (!this.selected && this.selections[0]) void this.select(this.selections[0]);
 		} catch (error) {
+			this.remoteLoading = false;
 			this.timelineEl.empty();
 			this.timelineEl.createEl("p", { text: `Failed to load history: ${(error as Error).message}`, cls: styles.danger });
 		}
@@ -170,11 +165,11 @@ export class FileHistoryPanel {
 						this.showMetadataRevisions = !this.showMetadataRevisions;
 						if (!this.showMetadataRevisions && this.selected?.source === "metadata") {
 							const fallback = this.selections.find(selection => selection.source !== "metadata");
+							this.renderTimeline();
 							if (fallback) void this.select(fallback);
 							else {
 								this.selected = null;
 								this.previewEl.empty();
-								this.renderTimeline();
 							}
 						} else this.renderTimeline();
 					});
@@ -220,7 +215,7 @@ export class FileHistoryPanel {
 				this.finishCancelledMetadataScan();
 				return;
 			}
-			await this.classifyRemoteRevisions();
+			this.classifyRemoteRevisions();
 			const remoteRevisions = this.selections
 				.filter((selection): selection is Extract<HistorySelection, { source: "remote" }> => selection.source === "remote")
 				.map(selection => selection.revision)
@@ -335,10 +330,14 @@ export class FileHistoryPanel {
 	private renderTimeline(): void {
 		this.timelineEl.empty();
 		this.versionEntries.clear();
+		this.versionButtons.clear();
 		this.metadataScanProgressEl = null;
 		if (this.remoteError) this.timelineEl.createEl("p", { text: `Cloud history unavailable: ${this.remoteError}`, cls: styles.danger });
 		if (this.remoteLoading) {
-			this.timelineEl.createEl("p", { text: "Scanning older versions…", cls: styles.meta });
+			this.timelineEl.createEl("p", {
+				text: this.selections.length === 0 ? "Loading cloud versions…" : "Loading cloud versions in the background…",
+				cls: styles.meta
+			});
 		} else if (this.seededRevision?.deleted && this.deletedHistoryScanned > 0) {
 			const message = this.deletedHistoryBatchEmpty && this.nextCommit
 				? `No older content change in this batch · ${this.deletedHistoryScanned.toLocaleString()} commits checked`
@@ -348,7 +347,7 @@ export class FileHistoryPanel {
 		if (!this.seededRevision?.deleted) this.renderMetadataScanControl();
 		const visibleSelections = this.selections.filter(selection => this.showMetadataRevisions || selection.source !== "metadata");
 		if (visibleSelections.length === 0) {
-			this.timelineEl.createEl("p", { text: "No retained versions were found.", cls: styles.meta });
+			if (!this.remoteLoading) this.timelineEl.createEl("p", { text: "No retained versions were found.", cls: styles.meta });
 			return;
 		}
 		for (const selection of visibleSelections) {
@@ -388,7 +387,9 @@ export class FileHistoryPanel {
 				attr: { title: `${new Date(this.createdAt(selection)).toLocaleString()} · ${source}` }
 			});
 			button.addEventListener("click", () => { void this.select(selection); });
-			this.versionEntries.set(this.selectionId(selection), entry);
+			const id = this.selectionId(selection);
+			this.versionEntries.set(id, entry);
+			this.versionButtons.set(id, button);
 		}
 		if (this.nextCommit && this.metadataScanState !== "scanning") {
 			const buttonText = this.remoteLoading
@@ -406,7 +407,7 @@ export class FileHistoryPanel {
 							...this.selections,
 							...page.revisions.map(revision => ({ source: "remote" as const, revision }))
 						]);
-						await this.classifyRemoteRevisions();
+						this.classifyRemoteRevisions();
 					} catch (error) {
 						new Notice(`Older versions could not be loaded: ${(error as Error).message}`);
 					} finally {
@@ -420,8 +421,9 @@ export class FileHistoryPanel {
 	}
 
 	private async select(selection: HistorySelection): Promise<void> {
+		const generation = ++this.selectionGeneration;
 		this.selected = selection;
-		this.renderTimeline();
+		this.updateTimelineSelection();
 		this.previewEl.empty();
 		this.revokeObjectUrl();
 		if (selection.source === "metadata") {
@@ -431,15 +433,18 @@ export class FileHistoryPanel {
 		this.previewEl.createEl("p", { text: "Loading revision…", cls: styles.meta });
 		try {
 			const content = await this.readSelection(selection);
+			if (!this.isSelectionCurrent(selection, generation)) return;
 			this.previewEl.empty();
-			await this.renderContent(selection, content);
-			this.renderActions(selection);
+			await this.renderContent(selection, content, generation);
+			if (this.isSelectionCurrent(selection, generation)) this.renderActions(selection);
 		} catch (error) {
+			if (!this.isSelectionCurrent(selection, generation)) return;
 			if (selection.source === "local") {
 				this.selections = this.selections.filter(candidate =>
 					candidate.source !== "local" || candidate.checkpoint.objectId !== selection.checkpoint.objectId
 				);
 				const fallback = this.selections.find(candidate => candidate.source !== "metadata") ?? this.selections[0];
+				this.renderTimeline();
 				console.warn("[Seafile Improved] Local checkpoint unavailable", { path: this.path, checkpoint: selection.checkpoint.id, error });
 				if (fallback) {
 					new Notice("Local checkpoint unavailable; showing the next retained version.");
@@ -452,7 +457,23 @@ export class FileHistoryPanel {
 		}
 	}
 
-	private async renderContent(selection: HistorySelection, content: ArrayBuffer): Promise<void> {
+	private updateTimelineSelection(): void {
+		const selectedId = this.selected ? this.selectionId(this.selected) : "";
+		for (const [id, entry] of this.versionEntries) {
+			const active = id === selectedId;
+			entry.toggleClass(styles.selectedVersion, active);
+			this.versionButtons.get(id)?.toggleClass(styles.selected, active);
+		}
+		if (this.embedded && selectedId) this.versionEntries.get(selectedId)?.append(this.previewEl);
+	}
+
+	private isSelectionCurrent(selection: HistorySelection, generation: number): boolean {
+		return generation === this.selectionGeneration
+			&& this.selected !== null
+			&& this.selectionId(this.selected) === this.selectionId(selection);
+	}
+
+	private async renderContent(selection: HistorySelection, content: ArrayBuffer, generation: number): Promise<void> {
 		const lower = this.path.toLowerCase();
 		const textLimit = historyTextDiffLimit(this.path);
 		const isText = historyTextKind(this.path) !== null || isLikelyTextContent(content);
@@ -472,6 +493,7 @@ export class FileHistoryPanel {
 				comparisonLabel = "File deletion compared with the retained content.";
 			} else if (this.comparisonMode === "current") {
 				const current = await this.plugin.app.vault.adapter.read(this.path).catch(() => "");
+				if (!this.isSelectionCurrent(selection, generation)) return;
 				if (new TextEncoder().encode(current).byteLength > textLimit) {
 					this.previewEl.createDiv({ text: "The current file is too large for an inline comparison.", cls: styles.meta });
 					return;
@@ -480,6 +502,7 @@ export class FileHistoryPanel {
 				comparisonLabel = "Compared with the file currently in the vault.";
 			} else if (previous) {
 				const previousContent = await this.readSelection(previous);
+				if (!this.isSelectionCurrent(selection, generation)) return;
 				if (previousContent.byteLength > textLimit) {
 					this.previewEl.createDiv({ text: "The previous version is too large for an inline comparison.", cls: styles.meta });
 					return;
@@ -605,7 +628,7 @@ export class FileHistoryPanel {
 		return selection.source === "local" ? null : selection.revision;
 	}
 
-	private async classifyRemoteRevisions(): Promise<void> {
+	private classifyRemoteRevisions(): void {
 		const revisions = this.selections
 			.filter((selection): selection is Extract<HistorySelection, { source: "remote" }> => selection.source === "remote")
 			.map(selection => selection.revision)
@@ -624,12 +647,10 @@ export class FileHistoryPanel {
 				this.remoteRevisionKinds.set(revision.commitId, "modified");
 				continue;
 			}
-			try {
-				const result = await this.plugin.history.scanFileMetadataRevision(revision, revision.path);
-				this.remoteRevisionKinds.set(revision.commitId, result.creationBoundary ? "created" : "modified");
-			} catch {
-				this.remoteRevisionKinds.set(revision.commitId, "unknown");
-			}
+			// The file-history endpoint does not identify creation explicitly. Avoid an
+			// automatic commit-tree scan here: it can be far more expensive than loading
+			// the history itself. The explicit metadata scan can identify that boundary.
+			this.remoteRevisionKinds.set(revision.commitId, "unknown");
 		}
 	}
 
@@ -671,17 +692,42 @@ export class FileHistoryPanel {
 	private async readSelection(selection: HistorySelection): Promise<ArrayBuffer> {
 		const id = this.selectionId(selection);
 		const cached = this.contentCache.get(id);
-		if (cached) return cached;
+		if (cached) {
+			this.contentCache.delete(id);
+			this.contentCache.set(id, cached);
+			return cached;
+		}
 		const content = selection.source !== "local"
 			? (await this.plugin.history.readRevision(selection.revision)).content
 			: await this.plugin.checkpoints.read(selection.checkpoint);
-		this.contentCache.set(id, content);
+		this.cacheContent(id, content);
 		return content;
 	}
 
+	private cacheContent(id: string, content: ArrayBuffer): void {
+		if (content.byteLength > FileHistoryPanel.CONTENT_CACHE_LIMIT_BYTES) return;
+		const previous = this.contentCache.get(id);
+		if (previous) this.contentCacheBytes -= previous.byteLength;
+		this.contentCache.delete(id);
+		this.contentCache.set(id, content);
+		this.contentCacheBytes += content.byteLength;
+		while (this.contentCacheBytes > FileHistoryPanel.CONTENT_CACHE_LIMIT_BYTES) {
+			const oldestId = this.contentCache.keys().next().value as string | undefined;
+			if (!oldestId) break;
+			const oldest = this.contentCache.get(oldestId);
+			this.contentCache.delete(oldestId);
+			this.contentCacheBytes -= oldest?.byteLength ?? 0;
+		}
+	}
+
 	private sortSelections(selections: HistorySelection[]): HistorySelection[] {
-		return selections.filter((selection, index, all) => all.findIndex(candidate => this.selectionId(candidate) === this.selectionId(selection)) === index)
-			.sort((left, right) => this.createdAt(right) - this.createdAt(left));
+		const seen = new Set<string>();
+		return selections.filter(selection => {
+			const id = this.selectionId(selection);
+			if (seen.has(id)) return false;
+			seen.add(id);
+			return true;
+		}).sort((left, right) => this.createdAt(right) - this.createdAt(left));
 	}
 
 	private selectionId(selection: HistorySelection): string {
@@ -690,7 +736,6 @@ export class FileHistoryPanel {
 
 	private relativeTime(timestamp: number): string {
 		const delta = timestamp - Date.now();
-		const formatter = new Intl.RelativeTimeFormat(undefined, { numeric: "auto", style: "short" });
 		for (const [unit, milliseconds] of [
 			["year", 365 * 24 * 60 * 60 * 1000],
 			["month", 30 * 24 * 60 * 60 * 1000],
@@ -698,7 +743,7 @@ export class FileHistoryPanel {
 			["hour", 60 * 60 * 1000],
 			["minute", 60 * 1000]
 		] as Array<[Intl.RelativeTimeFormatUnit, number]>) {
-			if (Math.abs(delta) >= milliseconds || unit === "minute") return formatter.format(Math.round(delta / milliseconds), unit);
+			if (Math.abs(delta) >= milliseconds || unit === "minute") return this.relativeTimeFormatter.format(Math.round(delta / milliseconds), unit);
 		}
 		return "now";
 	}

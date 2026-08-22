@@ -13,6 +13,47 @@ function createServer(response: unknown): { server: Server, request: jest.Mock }
 }
 
 describe("Seafile history APIs", () => {
+	test("prefers indexed, page-based file history", async () => {
+		const { server, request } = createServer({
+			data: [{
+				commit_id: "commit-a", path: "/note.md", ctime: "2026-08-05T10:00:00+00:00",
+				creator_name: "Alex", creator_email: "alex@example.test", op_type: "modify",
+				size: 12, rev_file_id: "file-a", old_path: "/old.md"
+			}],
+			total_count: 60
+		});
+
+		const result = await server.getFileHistory("/note.md");
+
+		expect(result).toMatchObject({
+			revisions: [expect.objectContaining({
+				commitId: "commit-a", description: "modify", renamedFrom: "/old.md"
+			})],
+			nextCommit: "indexed-page:2"
+		});
+		expect(request).toHaveBeenCalledWith(expect.objectContaining({
+			url: expect.stringContaining("file/new_history/?path=%2Fnote.md&page=1&per_page=50"),
+			retry: 0,
+			timeoutMs: 15 * 1000
+		}));
+	});
+
+	test("falls back to legacy file history on older servers", async () => {
+		const { server, request } = createServer({});
+		const warning = jest.spyOn(debug, "warn").mockImplementation(() => undefined);
+		request
+			.mockRejectedValueOnce(new HttpError(404, "Not found", "GET /api/v2.1/repos/{id}/file/new_history/"))
+			.mockResolvedValueOnce({ data: [], next_start_commit: null });
+
+		await expect(server.getFileHistory("/note.md")).resolves.toEqual({ revisions: [], nextCommit: null });
+
+		expect(request).toHaveBeenNthCalledWith(2, expect.objectContaining({
+			url: expect.stringContaining("file/history/?path=%2Fnote.md&limit=50")
+		}));
+		expect(warning).toHaveBeenCalledTimes(1);
+		warning.mockRestore();
+	});
+
 	test("maps file-history fields and continuation commits", async () => {
 		const { server, request } = createServer({
 			data: [{
@@ -31,7 +72,9 @@ describe("Seafile history APIs", () => {
 		});
 		expect(result.nextCommit).toBe("commit-b");
 		expect(request).toHaveBeenCalledWith(expect.objectContaining({
-			url: expect.stringContaining("file/history/?path=%2Fnote.md&limit=25&commit_id=start")
+			url: expect.stringContaining("file/history/?path=%2Fnote.md&limit=25&commit_id=start"),
+			retry: 0,
+			timeoutMs: 15 * 1000
 		}));
 	});
 

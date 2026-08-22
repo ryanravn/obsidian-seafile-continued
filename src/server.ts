@@ -61,6 +61,7 @@ export class RequestParam {
 	body?: string | ArrayBuffer;
 	headers?: Record<string, string>;
 	retry?: number;
+	timeoutMs?: number;
 }
 
 // Normalized response surface returned by the low-level request layer, so the
@@ -241,9 +242,13 @@ export default class Server {
 	}
 
 	private async request (req: RequestUrlParam & RequestParam): Promise<RequestResponse> {
+		const timeoutMs = req.timeoutMs ?? Server.REQUEST_TIMEOUT_MS;
 		if(!this.settings.useFetch)
 		{
-			const response = await pTimeout(requestUrl(req), { milliseconds: Server.REQUEST_TIMEOUT_MS });
+			const response = await pTimeout(requestUrl(req), {
+				milliseconds: timeoutMs,
+				message: `Seafile request timed out after ${timeoutMs / 1000} seconds.`
+			});
 			return {
 				status: response.status,
 				text: () => Promise.resolve(response.text),
@@ -260,12 +265,12 @@ export default class Server {
 				headers["Content-Type"] = req.contentType;
 			}
 			const withTimeout = async <T>(task: () => Promise<T>): Promise<T> => {
-				const timeoutId = window.setTimeout(() => controller.abort(), Server.REQUEST_TIMEOUT_MS);
+				const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
 				try {
 					return await task();
 				} catch (error) {
 					if (controller.signal.aborted) {
-						throw new Error(`Seafile request timed out after ${Server.REQUEST_TIMEOUT_MS / 1000} seconds.`);
+						throw new Error(`Seafile request timed out after ${timeoutMs / 1000} seconds.`);
 					}
 					throw error;
 				} finally {
@@ -291,10 +296,10 @@ export default class Server {
 	private async sendRequest (param: RequestParam): Promise<unknown> {
 		const req: RequestUrlParam & RequestParam = { ...param };
 		req.throw = false;
-		req.retry = req.retry || 1;
+		req.retry = req.retry ?? 1;
 		req.method = req.method || "GET";
 
-		const resp = await pRetry(async () => await this.requestThrottled(req), { retries: param.retry });
+		const resp = await pRetry(async () => await this.requestThrottled(req), { retries: req.retry });
 		const status = resp.status.toString();
 		let ret: unknown = null;
 
@@ -563,10 +568,57 @@ export default class Server {
 	}
 
 	async getFileHistory(remotePath: string, startCommit = "", limit = 50): Promise<{ revisions: FileRevision[], nextCommit: string | null }> {
+		const indexedPage = startCommit.startsWith("indexed-page:")
+			? Number(startCommit.slice("indexed-page:".length))
+			: startCommit ? null : 1;
+		if (indexedPage !== null && Number.isInteger(indexedPage) && indexedPage > 0) {
+			try {
+				return await this.getIndexedFileHistory(remotePath, indexedPage, limit);
+			} catch (error) {
+				const canUseLegacyEndpoint = indexedPage === 1
+					&& error instanceof HttpError
+					&& [404, 405, 500, 501].includes(error.status);
+				if (!canUseLegacyEndpoint) throw error;
+				utils.debug.warn("[Seafile Improved] Indexed file history is unavailable; using the compatibility endpoint.", {
+					status: error.status,
+					request: error.requestContext
+				});
+			}
+		}
+		return await this.getLegacyFileHistory(remotePath, startCommit, limit);
+	}
+
+	private async getIndexedFileHistory(remotePath: string, page: number, perPage: number): Promise<{ revisions: FileRevision[], nextCommit: string | null }> {
+		const query = new URLSearchParams({ path: remotePath, page: String(page), per_page: String(perPage) });
+		const response = await this.requestAPIv21({
+			url: `repos/${this.settings.repoId}/file/new_history/?${query.toString()}`,
+			retry: 0,
+			timeoutMs: 15 * 1000
+		}) as {
+			data?: Array<{
+				commit_id?: unknown, path?: unknown, ctime?: unknown, creator_name?: unknown,
+				creator_email?: unknown, op_type?: unknown, size?: unknown, rev_file_id?: unknown,
+				old_path?: unknown
+			}>,
+			total_count?: unknown
+		};
+		const revisions = this.parseFileHistoryRevisions(response.data, remotePath, true);
+		const totalCount = typeof response.total_count === "number"
+			? response.total_count
+			: Number(response.total_count);
+		const hasMore = Number.isFinite(totalCount)
+			? page * perPage < totalCount
+			: revisions.length === perPage;
+		return { revisions, nextCommit: hasMore ? `indexed-page:${page + 1}` : null };
+	}
+
+	private async getLegacyFileHistory(remotePath: string, startCommit: string, limit: number): Promise<{ revisions: FileRevision[], nextCommit: string | null }> {
 		const query = new URLSearchParams({ path: remotePath, limit: String(limit) });
 		if (startCommit) query.set("commit_id", startCommit);
 		const response = await this.requestAPIv21({
-			url: `repos/${this.settings.repoId}/file/history/?${query.toString()}`
+			url: `repos/${this.settings.repoId}/file/history/?${query.toString()}`,
+			retry: 0,
+			timeoutMs: 15 * 1000
 		}) as {
 			data?: Array<{
 				commit_id?: unknown, path?: unknown, ctime?: unknown, creator_name?: unknown,
@@ -576,7 +628,25 @@ export default class Server {
 			next_start_commit?: unknown
 		};
 
-		const revisions = (response.data ?? []).flatMap(item => {
+		const revisions = this.parseFileHistoryRevisions(response.data, remotePath);
+		return {
+			revisions,
+			nextCommit: typeof response.next_start_commit === "string" && response.next_start_commit
+				? response.next_start_commit
+				: null
+		};
+	}
+
+	private parseFileHistoryRevisions(
+		data: Array<{
+			commit_id?: unknown, path?: unknown, ctime?: unknown, creator_name?: unknown,
+			creator_email?: unknown, description?: unknown, op_type?: unknown, size?: unknown,
+			rev_file_id?: unknown, rev_renamed_old_path?: unknown, old_path?: unknown
+		}> | undefined,
+		remotePath: string,
+		indexed = false
+	): FileRevision[] {
+		return (data ?? []).flatMap(item => {
 			if (typeof item.commit_id !== "string" || typeof item.ctime !== "string") return [];
 			return [{
 				commitId: item.commit_id,
@@ -584,18 +654,16 @@ export default class Server {
 				createdAt: Date.parse(item.ctime),
 				authorName: typeof item.creator_name === "string" ? item.creator_name : "",
 				authorEmail: typeof item.creator_email === "string" ? item.creator_email : "",
-				description: typeof item.description === "string" ? item.description : "",
+				description: typeof item.description === "string"
+					? item.description
+					: indexed && typeof item.op_type === "string" ? item.op_type : "",
 				size: typeof item.size === "number" ? item.size : Number(item.size) || 0,
 				fileId: typeof item.rev_file_id === "string" ? item.rev_file_id : "",
-				renamedFrom: typeof item.rev_renamed_old_path === "string" && item.rev_renamed_old_path ? item.rev_renamed_old_path : undefined
+				renamedFrom: typeof item.rev_renamed_old_path === "string" && item.rev_renamed_old_path
+					? item.rev_renamed_old_path
+					: typeof item.old_path === "string" && item.old_path ? item.old_path : undefined
 			}];
 		});
-		return {
-			revisions,
-			nextCommit: typeof response.next_start_commit === "string" && response.next_start_commit
-				? response.next_start_commit
-				: null
-		};
 	}
 
 	async getLibraryHistory(page = 1, perPage = 50): Promise<{ revisions: LibraryRevision[], more: boolean }> {
