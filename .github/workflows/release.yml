@@ -1,90 +1,73 @@
-name: Build and Release
+name: Release
 
 on:
   push:
-    branches:
-      - master
+    tags:
+      - "*.*.*"
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build-and-release:
+  release:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+
     steps:
-      - uses: actions/checkout@v3
+      - name: Check out repository
+        uses: actions/checkout@v6
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
         with:
-          node-version: '18'
-
-      - name: Install pnpm
-        run: npm install -g pnpm
+          node-version: "24"
+          cache: npm
 
       - name: Install dependencies
-        run: pnpm install
+        run: npm ci
 
-      - name: Run unit tests
-        # server.test.ts and sync_controller.test.ts are integration tests that
-        # hit a live Seafile server (need src/test/env.ts, gitignored) and are
-        # excluded here; they're for local/manual use only.
-        run: pnpm exec jest --testPathIgnorePatterns='server\.test\.ts' --testPathIgnorePatterns='sync_controller\.test\.ts'
+      - name: Validate release metadata
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          test "$(node -p "require('./manifest.json').version")" = "$RELEASE_VERSION"
+          test "$(node -p "require('./package.json').version")" = "$RELEASE_VERSION"
+          node -e "const versions = require('./versions.json'); if (!versions[process.env.RELEASE_VERSION]) process.exit(1)"
+
+      - name: Run tests
+        run: npm test -- --runInBand
+
+      - name: Lint source
+        run: npm run lint
 
       - name: Build project
-        run: pnpm run build
+        run: npm run build
 
-      - name: Generate artifact attestations
-        uses: actions/attest-build-provenance@v1
+      - name: Attest release artifacts
+        uses: actions/attest@v4
         with:
           subject-path: |
             dist/main.js
             dist/styles.css
             dist/manifest.json
 
-      - name: Read version from manifest
-        id: package_version
-        run: echo "VERSION=$(jq -r '.version' manifest.json)" >> "$GITHUB_OUTPUT"
-        shell: bash
-      
-      - name: Delete existing release
-        id: check_release
-        uses: actions/github-script@v6
-        with:
-          github-token: ${{secrets.GITHUB_TOKEN}}
-          script: |
-            const { data: releases } = await github.rest.repos.listReleases({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-            });
-            const release = releases.find(release => release.tag_name === '${{ steps.package_version.outputs.VERSION }}');
-            if (release) {
-              console.log(`Release ${release.tag_name} exists. Deleting...`);
-              await github.rest.repos.deleteRelease({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                release_id: release.id,
-              });
-              await github.rest.git.deleteRef({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                ref: 'tags/' + release.tag_name,
-              });
-              return true;
-            } else {
-              console.log('Release does not exist. Proceeding to create a new one.');
-              return false;
-            }
-
-      - name: Create release
-        id: create_release
-        uses: ncipollo/release-action@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          tag: ${{ steps.package_version.outputs.VERSION }}
-          artifacts: "dist/*"
-          prerelease: false
-          makeLatest: true
-          generateReleaseNotes: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/main.js \
+            dist/styles.css \
+            dist/manifest.json \
+            --verify-tag \
+            --generate-notes \
+            --latest
