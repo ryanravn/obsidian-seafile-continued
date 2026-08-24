@@ -188,7 +188,7 @@ export class SyncController {
 	public constructor (
     private readonly adapter: DataAdapter,
 	private readonly settings: SeafileSettings) {
-		this.policy = new ObsidianSyncPolicy(app?.vault?.configDir ?? ".obsidian", PLUGIN_DIR ? Path.basename(PLUGIN_DIR) : "seafile-improved", settings);
+		this.policy = new ObsidianSyncPolicy(app?.vault?.configDir ?? ".obsidian", PLUGIN_DIR ? Path.basename(PLUGIN_DIR) : "seafile-continued", settings);
 	}
 
 	public onMassDeletionWarning: ((warning: MassDeletionWarning) => Promise<boolean>) | null = null;

@@ -143,14 +143,14 @@ describe("Seafile ignore patterns", () => {
 		expect(updated).toContain("# Add your own Seafile ignore patterns below this line.\n*.tmp\n");
 	});
 
-	test("renames the legacy managed markers without duplicating the section", () => {
+	test.each(["Obsidian Seafile Sync", "Seafile Improved"])("renames the legacy %s managed markers without duplicating the section", legacyName => {
 		const legacyManaged = createDefaultIgnoreFile(".obsidian", "seafile-improved", DEFAULT_SETTINGS)
-			.replace("Obsidian Seafile Sync managed defaults", "Seafile Improved managed defaults")
-			.replace("Obsidian Seafile Sync managed defaults", "Seafile Improved managed defaults");
+			.replace(MANAGED_IGNORE_START, `# BEGIN ${legacyName} managed defaults`)
+			.replace(MANAGED_IGNORE_END, `# END ${legacyName} managed defaults`);
 		const updated = upsertManagedIgnoreBlock(legacyManaged, ".obsidian", "seafile-improved", DEFAULT_SETTINGS);
 
 		expect(updated.match(new RegExp(MANAGED_IGNORE_START, "g"))).toHaveLength(1);
-		expect(updated).not.toContain("Seafile Improved managed defaults");
+		expect(updated).not.toContain(`${legacyName} managed defaults`);
 	});
 });
 

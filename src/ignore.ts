@@ -1,10 +1,18 @@
 import { LIBRARY_POLICY_FILE } from "./sync/library_policy";
 
 export const SEAFILE_IGNORE_FILE = "seafile-ignore.txt";
-export const MANAGED_IGNORE_START = "# BEGIN Obsidian Seafile Sync managed defaults";
-export const MANAGED_IGNORE_END = "# END Obsidian Seafile Sync managed defaults";
-const LEGACY_MANAGED_IGNORE_START = "# BEGIN Seafile Improved managed defaults";
-const LEGACY_MANAGED_IGNORE_END = "# END Seafile Improved managed defaults";
+export const MANAGED_IGNORE_START = "# BEGIN Seafile Sync managed defaults";
+export const MANAGED_IGNORE_END = "# END Seafile Sync managed defaults";
+const LEGACY_MANAGED_IGNORE_MARKERS = [
+	{
+		start: "# BEGIN Obsidian Seafile Sync managed defaults",
+		end: "# END Obsidian Seafile Sync managed defaults"
+	},
+	{
+		start: "# BEGIN Seafile Improved managed defaults",
+		end: "# END Seafile Improved managed defaults"
+	}
+];
 
 export interface ManagedIgnoreSettings {
 	syncMainSettings: boolean
@@ -85,7 +93,7 @@ export function createManagedIgnoreBlock(configDir: string, pluginId: string, se
 		`${configDir}/workspace.json`,
 		`${configDir}/workspace-mobile.json`,
 		"",
-		"# Obsidian Seafile Sync installation and device state",
+		"# Seafile Sync installation and device state",
 		`${configDir}/plugins/${pluginId}/`
 	];
 	if (settings) {
@@ -117,9 +125,14 @@ export function replaceManagedIgnoreBlock(
 	let end = contents.indexOf(MANAGED_IGNORE_END);
 	let endMarker = MANAGED_IGNORE_END;
 	if (start < 0 || end < start) {
-		start = contents.indexOf(LEGACY_MANAGED_IGNORE_START);
-		end = contents.indexOf(LEGACY_MANAGED_IGNORE_END);
-		endMarker = LEGACY_MANAGED_IGNORE_END;
+		for (const markers of LEGACY_MANAGED_IGNORE_MARKERS) {
+			start = contents.indexOf(markers.start);
+			end = contents.indexOf(markers.end);
+			if (start >= 0 && end >= start) {
+				endMarker = markers.end;
+				break;
+			}
+		}
 	}
 	if (start < 0 || end < start) return null;
 	const after = end + endMarker.length;

@@ -915,7 +915,7 @@ export class HistoryView extends ItemView {
 					new Dialog(
 						this.app,
 						"Replace library sync policy",
-						"Replace the shared library policy with the synchronization categories currently selected on this device? Other Obsidian Seafile Sync devices will adopt these choices.",
+						"Replace the shared library policy with the synchronization categories currently selected on this device? Other Seafile Sync devices will adopt these choices.",
 						async () => {
 							try {
 								await this.plugin.repairLibraryPolicy();

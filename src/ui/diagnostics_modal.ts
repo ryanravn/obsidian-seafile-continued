@@ -6,7 +6,7 @@ export class DiagnosticsModal extends Modal {
 	}
 
 	onOpen(): void {
-		this.titleEl.textContent = "Obsidian Seafile Sync diagnostics";
+		this.titleEl.textContent = "Seafile Sync diagnostics";
 		this.contentEl.createEl("p", {
 			text: "Review before sharing. Credentials, server and repository identifiers, file paths, issue messages, and commit IDs are excluded."
 		});

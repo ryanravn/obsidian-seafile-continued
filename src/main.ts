@@ -44,7 +44,7 @@ export default class SeafilePlugin extends Plugin {
 		initConfig(this.app, this.server, this.manifest.id, this.settings);
 		this.issues = new SyncIssueStore(this.app);
 		const reportMaintenanceFailure = ({ operation, error }: StartupMaintenanceFailure): void => {
-			debug.warn(`[Obsidian Seafile Sync] ${operation} failed during startup.`, error);
+			debug.warn(`[Seafile Sync] ${operation} failed during startup.`, error);
 			this.issues.add({
 				kind: "error",
 				message: `${operation} failed during startup: ${error.message}`,

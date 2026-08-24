@@ -1,16 +1,8 @@
-# Obsidian Seafile Sync
+# Seafile Sync
 
 An [Obsidian](https://obsidian.md/) plugin for synchronizing notes across devices using [Seafile](https://www.seafile.com/), an open-source, self-hosted file sync and share solution.
 
-## Fork status
-
-This repository is a maintained fork of [ryanravn/obsidian-seafile-continued](https://github.com/ryanravn/obsidian-seafile-continued), which is itself a community continuation of [conql/obsidian-seafile](https://github.com/conql/obsidian-seafile).
-
-We intend to contribute generally useful fixes and features back upstream. Until those changes are accepted, this fork maintains and releases them independently. If a change does not fit upstream's direction, we will continue maintaining it here rather than removing it from the fork.
-
-## What's different in this fork
-
-Compared with upstream release `0.3.22`, this fork currently adds:
+## Highlights
 
 - **Realtime synchronization** through Seafile's notification server, with automatic fallback to periodic synchronization and connection state shown in the UI.
 - **Manual API-token authentication** for setups where password or browser-SSO login is not appropriate.
@@ -23,7 +15,6 @@ Compared with upstream release `0.3.22`, this fork currently adds:
 - **Guided new-device onboarding** that walks through the server, account, remote library, and initial synchronization without requiring a preconfigured vault.
 - **Integrated version history and recovery** with per-file diffs, grouped library activity, deleted-file recovery, whole-vault snapshot previews and restore, plus optional device-local offline checkpoints.
 - **Built-in diagnostics and repair** with a persistent device-local sync-issues center, a read-only vault verification report, and a sync-index rebuild that preserves vault files.
-- **Hardened development automation** with pull-request CI across Node.js 20 and 24, strict source linting, reproducible npm installs, tested release preparation, version consistency checks, artifact attestations, and immutable tag-based releases.
 
 ## Features
 
@@ -34,23 +25,19 @@ Compared with upstream release `0.3.22`, this fork currently adds:
 
 ## Install and initialize a new device
 
-The recommended setup uses the [Obsidian community plugin marketplace](https://community.obsidian.md/plugins/seafile-improved):
-
 1. Create and open a new empty Obsidian vault.
-2. Open **Settings → Community plugins**, install **Seafile Sync Improved**, and enable it.
+2. Open **Settings → Community plugins**, install **Seafile Sync**, and enable it.
 3. Open the plugin settings and follow **Initialize from remote**.
 4. Enter the Seafile server URL and log in with your password, browser SSO, or a manually supplied API token.
 5. Choose the existing remote library, unlock it if it is encrypted, and select **Start initial sync**.
 
 The initial synchronization downloads the remote library. If the local vault is not empty, its existing files are merged and may be uploaded; start with an empty vault unless that merge is intentional.
 
-Each GitHub release also includes `obsidian-seafile-sync-vault-<version>.zip`. It is an optional ready-to-open empty vault with the plugin already installed and enabled. Extract it, open the contained **Obsidian Seafile Sync** folder as an Obsidian vault, allow community plugins if Obsidian asks, and then follow **Initialize from remote**. The template contains no credentials, repository selection, sync state, workspace state, or notes.
-
 ## Configuration
 
 After onboarding, the individual server, account, repository, and sync controls remain available in the plugin settings. Manual-token login asks for your account name so synchronized changes have the correct attribution. Account tokens, repository tokens, and remembered encrypted-library passwords are stored with Obsidian SecretStorage and are removed from the plugin's `data.json` during migration.
 
-Obsidian-aware settings separately control main configuration, appearance and snippets, hotkeys, core-plugin configuration, the active community-plugin list, community-plugin installation files, standard `data.json` settings, and additional plugin data. These library-wide selections are stored in the versioned `.obsidian-seafile-sync.json` file at the vault root so every Obsidian Seafile Sync device follows the same content policy. Existing installations seed that shared policy from their current settings when the library does not yet have one; devices joining an existing library adopt its policy. Per-plugin overrides can select `standard`, `all`, or `ignore` behavior where a plugin stores important user content or disposable runtime data outside `data.json`.
+Obsidian-aware settings separately control main configuration, appearance and snippets, hotkeys, core-plugin configuration, the active community-plugin list, community-plugin installation files, standard `data.json` settings, and additional plugin data. These library-wide selections are stored in the versioned `.obsidian-seafile-sync.json` file at the vault root so every Seafile Sync device follows the same content policy. Existing installations seed that shared policy from their current settings when the library does not yet have one; devices joining an existing library adopt its policy. Per-plugin overrides can select `standard`, `all`, or `ignore` behavior where a plugin stores important user content or disposable runtime data outside `data.json`.
 
 Smart conflict handling is enabled by default and remains a device-local preference. It performs bounded three-way merges using the last synchronized Seafile object as the common ancestor: Markdown and ordinary text merge by independent line edits, settings JSON merges recursively by key, Canvas arrays merge by stable object IDs, and Bases views merge by stable names. Concurrent changes to the same value, unparseable data, unavailable merge bases, binary files, and oversized files fall back to conflict copies. Users who prefer manual review can select **Always create conflict copies**.
 
@@ -109,23 +96,10 @@ If the configured repository is deleted or access is revoked, synchronization an
 
 ## Contribution & Support
 
-Open an issue in [this fork](https://github.com/tionis/obsidian-seafile-improved/issues) for bugs, feature requests, or questions about the functionality described above. Issues that also affect the upstream version may eventually be forwarded or proposed upstream.
+Open an issue in [this repository's tracker](../../issues) for bugs, feature requests, or questions.
 
-### Preparing a release
-
-Start from a clean working tree and run one of:
-
-```sh
-npm run release:prepare -- patch
-npm run release:prepare -- minor
-npm run release:prepare -- major
-npm run release:prepare -- 0.4.0
-```
-
-The command updates `package.json`, `package-lock.json`, `manifest.json`, and `versions.json`, then runs the credential-free tests and production build. Review and commit those changes before creating and pushing a tag with the exact same version. The tag triggers the release workflow, which builds and attests the plugin files and ready-to-use vault ZIP; existing tags and releases are never replaced.
-
-CI exercises the current Seafile HTTP contract through a real local HTTP boundary without credentials. Maintainers can additionally run the read-only smoke test against a deployment with `SEAFILE_URL`, `SEAFILE_TOKEN`, `SEAFILE_REPO_ID`, and `SEAFILE_REPO_TOKEN` set: `npm run test:seafile-smoke`.
+The test suite exercises the current Seafile HTTP contract through a real local HTTP boundary without credentials. Maintainers can additionally run the read-only smoke test against a deployment with `SEAFILE_URL`, `SEAFILE_TOKEN`, `SEAFILE_REPO_ID`, and `SEAFILE_REPO_TOKEN` set: `npm run test:seafile-smoke`.
 
 ## Credits
 
-Original plugin by [@conql](https://github.com/conql). The continued version was created and is maintained upstream by [@ryanravn](https://github.com/ryanravn). This fork is maintained by [@tionis](https://github.com/tionis).
+Original plugin by [@conql](https://github.com/conql). This continuation is maintained by [@ryanravn](https://github.com/ryanravn), with additional contributions from [@tionis](https://github.com/tionis).

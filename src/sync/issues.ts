@@ -19,7 +19,8 @@ export interface SyncIssue extends SyncIssueInput {
 	resolved: boolean
 }
 
-const STORAGE_KEY = "seafile-improved-sync-issues";
+const STORAGE_KEY = "seafile-sync-issues";
+const LEGACY_STORAGE_KEY = "seafile-improved-sync-issues";
 const MAX_ISSUES = 200;
 const SELF_HEALING_ERROR_PATTERNS = [
 	/changed while (?:it was )?being synchronized/i,
@@ -43,7 +44,7 @@ export class SyncIssueStore {
 	private readonly listeners = new Set<() => void>();
 
 	constructor(private readonly app: App) {
-		const stored: unknown = app.loadLocalStorage(STORAGE_KEY);
+		const stored: unknown = app.loadLocalStorage(STORAGE_KEY) ?? app.loadLocalStorage(LEGACY_STORAGE_KEY);
 		this.issues = Array.isArray(stored)
 			? stored.filter(isSyncIssue).filter(shouldSurfaceSyncIssue).slice(0, MAX_ISSUES)
 			: [];

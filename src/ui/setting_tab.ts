@@ -253,7 +253,7 @@ export class SeafileSettingTab extends PluginSettingTab {
 				items: [
 					{
 						name: "Shared across devices",
-						desc: "Every choice in this section is stored in the vault's shared policy file and adopted by all Obsidian Seafile Sync devices using this library."
+						desc: "Every choice in this section is stored in the vault's shared policy file and adopted by all Seafile Sync devices using this library."
 					},
 					{
 						name: "Main Obsidian settings",
