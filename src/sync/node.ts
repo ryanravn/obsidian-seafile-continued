@@ -12,7 +12,11 @@ export type STATE_UPLOAD = {
 	param: {
 		progress: number,
 		fs: SeafFs | null,
-		blocks?: Record<string, ArrayBuffer>
+		source?: {
+			path: string,
+			size: number,
+			mtime: number
+		}
 	}
 }
 export type STATE_SYNC = {
@@ -28,16 +32,21 @@ export type STATE_DELETE = {
 export type SyncState = STATE_INIT | STATE_DOWNLOAD | STATE_UPLOAD | STATE_SYNC | STATE_DELETE;
 
 export type SyncStateChangedListener = (node: SyncNode) => void;
+export type SyncStatesChangedListener = (nodes: SyncNode[]) => void;
 
 export type SerializedSyncNode = {
 	prev: SeafDirent | null,
+	policyExcluded?: boolean,
 	children: Record<string, SerializedSyncNode>
 }
 
-export type SerializedLogData = [string, SeafDirent | null];
+export type SerializedLogData = [string, SeafDirent | null, boolean?];
 
 export class SyncNode {
 	public static onStateChanged: SyncStateChangedListener | undefined;
+	public static onStatesChanged: SyncStatesChangedListener | undefined;
+	private static notificationBatchDepth = 0;
+	private static readonly batchedNotifications = new Set<SyncNode>();
 	private static _dataLogCount = 0;
 	public static get dataLogCount() { return this._dataLogCount; }
 	private static set dataLogCount(value: number) { this._dataLogCount = value; }
@@ -45,6 +54,7 @@ export class SyncNode {
 	public readonly path: string;
 	private children: Record<string, SyncNode> = {};
 	private _prev?: SeafDirent;
+	public policyExcluded = false;
 	public prevDirty = true; // prev means the last synced state
 	public next?: SeafDirent;
 	public nextDirty = true; // next means the pending upload state
@@ -65,11 +75,32 @@ export class SyncNode {
 		this._state = new Proxy(value, {
 			set: (target, prop, value) => {
 				Reflect.set(target, prop, value);
-				SyncNode.onStateChanged?.(this);
+				SyncNode.notifyStateChanged(this);
 				return true;
 			}
 		});
-		SyncNode.onStateChanged?.(this);
+		SyncNode.notifyStateChanged(this);
+	}
+
+	private static notifyStateChanged(node: SyncNode): void {
+		if (this.notificationBatchDepth > 0) {
+			this.batchedNotifications.add(node);
+			return;
+		}
+		this.onStateChanged?.(node);
+	}
+
+	private static beginNotificationBatch(): void {
+		this.notificationBatchDepth++;
+	}
+
+	private static endNotificationBatch(): void {
+		this.notificationBatchDepth--;
+		if (this.notificationBatchDepth !== 0 || this.batchedNotifications.size === 0) return;
+		const nodes = Array.from(this.batchedNotifications);
+		this.batchedNotifications.clear();
+		if (this.onStatesChanged) this.onStatesChanged(nodes);
+		else for (const node of nodes) this.onStateChanged?.(node);
 	}
 
 	public static serialize(node: SyncNode): SerializedSyncNode {
@@ -81,6 +112,7 @@ export class SyncNode {
 		}
 		return {
 			prev: node.prev!,
+			...(node.policyExcluded ? { policyExcluded: true } : {}),
 			children: children
 		};
 	}
@@ -88,6 +120,7 @@ export class SyncNode {
 	public static async deserialize(name: string, data: SerializedSyncNode, parent?: SyncNode): Promise<SyncNode> {
 		const node = new SyncNode(name, parent);
 		node.prev = data.prev ?? undefined;
+		node.policyExcluded = data.policyExcluded ?? false;
 		parent?.addChild(node);
 
 		const childEntries: [string, SerializedSyncNode][] = Object.entries(data.children);
@@ -113,7 +146,7 @@ export class SyncNode {
 		for (const line of logData) {
 			if (!line.trim()) continue;
 			try {
-				const [rawPath, dirent] = JSON.parse(line) as SerializedLogData;
+				const [rawPath, dirent, policyExcluded] = JSON.parse(line) as SerializedLogData;
 				let path = rawPath;
 				while (path.startsWith("/")) path = path.slice(1);
 				const parts = path.split("/");
@@ -126,12 +159,15 @@ export class SyncNode {
 					base = base.children[part];
 				}
 				if (dirent) {
-					if (name === "")
+					if (name === "") {
 						base.prev = dirent;
-					else if (!Object.prototype.hasOwnProperty.call(base.children, name))
-						base.children[name] = { prev: dirent, children: {} };
-					else
+						base.policyExcluded = policyExcluded ?? false;
+					} else if (!Object.prototype.hasOwnProperty.call(base.children, name)) {
+						base.children[name] = { prev: dirent, policyExcluded: policyExcluded ?? false, children: {} };
+					} else {
 						base.children[name].prev = dirent;
+						base.children[name].policyExcluded = policyExcluded ?? false;
+					}
 				}
 				else {
 					if (name === "")
@@ -156,9 +192,40 @@ export class SyncNode {
 		SyncNode.dataLogCount = 0;
 	}
 
+	public static async applyNextBatch(nodes: SyncNode[], onProgress?: (completed: number) => void): Promise<void> {
+		const changed = new Set<SyncNode>();
+		const lines: string[] = [];
+		for (const node of nodes) {
+			const next = node.next;
+			if (!(next?.id === node.prev?.id && next?.mtime === node.prev?.mtime)) {
+				changed.add(node);
+				lines.push(JSON.stringify([node.path, next ?? null] as SerializedLogData));
+			}
+		}
+		if (lines.length > 0) {
+			await adapter.append(SYNC_DLOG_PATH, lines.join("\n") + "\n");
+			SyncNode.dataLogCount += lines.length;
+		}
+
+		this.beginNotificationBatch();
+		try {
+			let completed = 0;
+			for (const node of nodes) {
+				if (changed.has(node)) node.prev = node.next;
+				node.policyExcluded = false;
+				node.prevDirty = node.nextDirty;
+				node.setNext(undefined, true);
+				node.state = node.prevDirty ? { type: "init" } : { type: "sync" };
+				onProgress?.(++completed);
+			}
+		} finally {
+			this.endNotificationBatch();
+		}
+	}
+
 	private async appendDataLog(dirent: SeafDirent | undefined | null) {
 		if (!dirent) dirent = null;
-		await adapter.append(SYNC_DLOG_PATH, JSON.stringify([this.path, dirent] as SerializedLogData) + "\n");
+		await adapter.append(SYNC_DLOG_PATH, JSON.stringify([this.path, dirent, this.policyExcluded || undefined] as SerializedLogData) + "\n");
 		SyncNode.dataLogCount++;
 	}
 
@@ -257,6 +324,31 @@ export class SyncNode {
 		this.nextDirty = dirty;
 	}
 
+	/** Discard computed upload state so the next cycle recomputes it from disk. */
+	clearPendingTree() {
+		this.next = undefined;
+		this.nextDirty = true;
+		if (this.state.type === "upload" || this.state.type === "download") {
+			this.state = { type: "init" };
+		}
+		for (const child of Object.values(this.children)) child.clearPendingTree();
+	}
+
+	markTreeDirty(): void {
+		this.prevDirty = true;
+		if (this.next) this.nextDirty = true;
+		if (this.state.type === "sync") this.state = { type: "init" };
+		for (const child of Object.values(this.children)) child.markTreeDirty();
+	}
+
+	/** Accept the existing remote baseline after dropping a metadata-only upload. */
+	discardPendingAsSynchronized() {
+		this.next = undefined;
+		this.nextDirty = true;
+		this.prevDirty = false;
+		this.state = this.prev ? { type: "sync" } : { type: "init" };
+	}
+
 	get prev(): SeafDirent | undefined {
 		return this._prev;
 	}
@@ -273,7 +365,14 @@ export class SyncNode {
 		this.prevDirty = dirty;
 	}
 
+	async setPolicyExcludedAsync(excluded: boolean): Promise<void> {
+		if (this.policyExcluded === excluded) return;
+		this.policyExcluded = excluded;
+		await this.appendDataLog(this.prev);
+	}
+
 	async applyNext() {
+		this.policyExcluded = false;
 		await this.setPrevAsync(this.next, this.nextDirty);
 		this.setNext(undefined, true);
 		if (!this.prevDirty) {
@@ -289,6 +388,8 @@ export class SyncNode {
 	}
 
 	async delete() {
+		this.setNext(undefined, true);
+		this.policyExcluded = false;
 		if (this.parent) {
 			this.parent.removeChild(this);
 		}
@@ -303,6 +404,7 @@ export class SyncNode {
 		});
 		return {
 			name: this.name,
+			policyExcluded: this.policyExcluded,
 			prevDirty: this.prevDirty,
 			prev: this.prev,
 			nextDirty: this.nextDirty,
@@ -316,6 +418,7 @@ export class SyncNode {
 // separate from SerializedSyncNode which is the real on-disk format.
 export interface DebugJson {
 	name: string
+	policyExcluded: boolean
 	prevDirty: boolean
 	prev?: SeafDirent
 	nextDirty: boolean

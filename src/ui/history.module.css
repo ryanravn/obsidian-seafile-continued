@@ -1,0 +1,636 @@
+.layout {
+	display: grid;
+	grid-template-columns: minmax(15rem, 0.8fr) minmax(20rem, 2fr);
+	gap: 1rem;
+	min-height: 24rem;
+}
+
+.fileHistoryModal {
+	width: min(92vw, 75rem);
+	max-width: 92vw;
+}
+
+.modalLayout {
+	min-height: min(65vh, 45rem);
+}
+
+.embeddedPanel {
+	min-width: 0;
+}
+
+.embeddedLayout {
+	grid-template-columns: minmax(0, 1fr);
+	min-height: 0;
+}
+
+.embeddedLayout .timeline {
+	border-right: 0;
+	padding-right: 0;
+	overflow: visible;
+}
+
+.embeddedLayout .preview {
+	border-left: 2px solid var(--interactive-accent);
+	margin: 0.25rem 0 0.6rem 0.65rem;
+	padding: 0.5rem 0 0.25rem 0.75rem;
+}
+
+.timeline {
+	border-right: 1px solid var(--background-modifier-border);
+	padding-right: 0.75rem;
+	overflow: auto;
+}
+
+.entry {
+	width: 100%;
+	text-align: left;
+	padding: 0.5rem 0.6rem;
+	margin: 0;
+	border-radius: var(--radius-s);
+	background: transparent;
+	box-shadow: none;
+	min-width: 0;
+}
+
+.entry:hover, .selected {
+	background: var(--background-modifier-hover);
+}
+
+.selected {
+	box-shadow: inset 2px 0 var(--interactive-accent);
+}
+
+.versionEntry {
+	border-left: 1px solid var(--background-modifier-border);
+	margin-left: 0.45rem;
+	padding: 0 0 0.35rem 0.65rem;
+	position: relative;
+}
+
+.versionEntry::before {
+	background: var(--background-primary);
+	border: 2px solid var(--text-faint);
+	border-radius: 50%;
+	content: "";
+	height: 0.5rem;
+	left: -0.32rem;
+	position: absolute;
+	top: 0.8rem;
+	width: 0.5rem;
+}
+
+.selectedVersion::before {
+	background: var(--interactive-accent);
+	border-color: var(--interactive-accent);
+}
+
+.metadataVersion::before {
+	background: var(--background-primary);
+	border-color: var(--text-muted);
+	border-style: dotted;
+}
+
+.metadataScanControl {
+	border-top: 0;
+	padding: 0.25rem 0 0.6rem;
+}
+
+.metadataSummary {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.metadataDetails {
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	margin-top: 0.75rem;
+	overflow: hidden;
+}
+
+.metadataDetail {
+	display: grid;
+	gap: 0.75rem;
+	grid-template-columns: minmax(7rem, 0.35fr) minmax(0, 1fr);
+	padding: 0.55rem 0.65rem;
+}
+
+.metadataDetail + .metadataDetail {
+	border-top: 1px solid var(--background-modifier-border);
+}
+
+.metadataField {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	font-weight: var(--font-semibold);
+}
+
+.metadataValues {
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+	overflow-wrap: anywhere;
+}
+
+.meta {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.preview {
+	min-width: 0;
+	overflow: auto;
+}
+
+.preview img {
+	max-width: 100%;
+	height: auto;
+}
+
+.diff {
+	font-family: var(--font-monospace);
+	white-space: pre-wrap;
+	font-size: var(--font-smaller);
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+
+.added {
+	background: rgba(var(--color-green-rgb), 0.16);
+	color: var(--text-success);
+}
+
+.removed {
+	background: rgba(var(--color-red-rgb), 0.16);
+	color: var(--text-error);
+}
+
+.toolbar {
+	background: var(--background-modifier-hover);
+	border-radius: var(--radius-s);
+	display: grid;
+	gap: 2px;
+	grid-template-columns: repeat(auto-fit, minmax(4.5rem, 1fr));
+	margin-bottom: 1rem;
+	padding: 2px;
+}
+
+.toolbar button {
+	box-shadow: none;
+	font-size: var(--font-ui-smaller);
+	min-width: 0;
+	overflow: hidden;
+	padding: 0.35rem 0.2rem;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.viewTitle {
+	font-size: var(--font-ui-large);
+	margin: 0 0 0.75rem;
+}
+
+.fileHeading {
+	font-size: var(--font-ui-medium);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.activity {
+	min-width: 0;
+	overflow: hidden;
+	padding: 0.65rem 0.7rem;
+}
+
+.historyTimeline {
+	border-left: 1px solid var(--background-modifier-border);
+	margin: 0.3rem 0 0 0.55rem;
+	padding-left: 0.9rem;
+}
+
+.dateDivider {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	font-weight: var(--font-semibold);
+	letter-spacing: 0.04em;
+	margin: 0.9rem 0 0.35rem;
+	text-transform: uppercase;
+}
+
+.timelineCard {
+	background: var(--background-secondary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	margin: 0 0 0.6rem;
+	min-width: 0;
+	position: relative;
+}
+
+.timelineCard::before {
+	background: var(--background-primary);
+	border: 2px solid var(--text-faint);
+	border-radius: 50%;
+	content: "";
+	height: 0.55rem;
+	left: -1.31rem;
+	position: absolute;
+	top: 0.85rem;
+	width: 0.55rem;
+}
+
+.timelineCard[open]::before {
+	background: var(--interactive-accent);
+	border-color: var(--interactive-accent);
+}
+
+.cardHeading {
+	align-items: center;
+	display: flex;
+	gap: 0.4rem;
+	min-width: 0;
+}
+
+.operationMarker {
+	align-items: center;
+	display: inline-flex;
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+	font-weight: var(--font-bold);
+	justify-content: center;
+	width: 1rem;
+	flex: 0 0 1rem;
+}
+
+.create {
+	color: var(--text-success);
+}
+
+.modify, .rename {
+	color: var(--text-accent);
+}
+
+.delete {
+	color: var(--text-error);
+}
+
+.restore, .snapshot {
+	color: var(--text-warning);
+}
+
+.unknown {
+	color: var(--text-muted);
+}
+
+.cardTitle, .commitTitle {
+	font-size: var(--font-ui-small);
+	font-weight: var(--font-semibold);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.cardTitle {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.revisionCount {
+	background: var(--background-modifier-hover);
+	border-radius: var(--radius-s);
+	color: var(--text-muted);
+	flex: 0 0 auto;
+	font-size: var(--font-ui-smaller);
+	font-weight: var(--font-normal);
+	padding: 0.05rem 0.35rem;
+	white-space: nowrap;
+}
+
+.commitCard {
+	padding: 0;
+}
+
+.commitSummary {
+	cursor: pointer;
+	min-width: 0;
+	padding: 0.65rem 0.7rem 0.65rem 1.8rem;
+	position: relative;
+	list-style: none;
+}
+
+.commitSummary::-webkit-details-marker,
+.fileChangeDetails > summary::-webkit-details-marker {
+	display: none;
+}
+
+.commitSummary::before,
+.fileChangeDetails > summary::before {
+	color: var(--text-muted);
+	content: "›";
+	font-size: 1.15em;
+	left: 0.65rem;
+	line-height: 1;
+	position: absolute;
+	top: 0.72rem;
+	transition: transform 120ms ease;
+}
+
+.commitCard[open] > .commitSummary::before,
+.activityCard[open] > .commitSummary::before,
+.fileChangeDetails[open] > summary::before {
+	transform: rotate(90deg);
+}
+
+.commitSummary:hover {
+	background: var(--background-modifier-hover);
+}
+
+.commitBody {
+	border-top: 1px solid var(--background-modifier-border);
+	padding: 0.6rem 0.7rem 0.4rem;
+}
+
+.changeSummary {
+	font-size: var(--font-ui-small);
+	margin-bottom: 0.5rem;
+}
+
+.fileChange {
+	border-top: 1px solid var(--background-modifier-border);
+	min-width: 0;
+}
+
+.fileChangeDetails, .fileChangeStatic {
+	min-width: 0;
+	padding: 0.35rem 0;
+}
+
+.fileChangeDetails > summary {
+	cursor: pointer;
+	list-style: none;
+	padding-left: 1rem;
+	position: relative;
+}
+
+.fileChangeDetails > summary::before {
+	left: 0;
+	top: 0.25rem;
+}
+
+.fileChangeHeader {
+	display: flex;
+	align-items: baseline;
+	gap: 0.45rem;
+	min-width: 0;
+}
+
+.changeMarker {
+	font-family: var(--font-monospace);
+	font-weight: var(--font-bold);
+	width: 1.2rem;
+	flex: 0 0 1.2rem;
+	text-align: center;
+}
+
+.created, .additionCount {
+	color: var(--text-success);
+}
+
+.modified {
+	color: var(--text-warning);
+}
+
+.metadataChanged {
+	color: var(--text-muted);
+}
+
+.deleted, .deletionCount {
+	color: var(--text-error);
+}
+
+.filePath {
+	flex: 1 1 auto;
+	font-family: var(--font-monospace);
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.lineStats {
+	color: var(--text-muted);
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+	margin-left: auto;
+	white-space: nowrap;
+}
+
+.diffHint {
+	background: var(--background-modifier-hover);
+	border-radius: var(--radius-s);
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	margin-left: 0.2rem;
+	padding: 0.05rem 0.3rem;
+	white-space: nowrap;
+}
+
+.activityFile {
+	align-items: center;
+	background: transparent;
+	box-shadow: none;
+	display: flex;
+	gap: 0.4rem;
+	min-width: 0;
+	padding: 0.25rem 0;
+	text-align: left;
+	width: 100%;
+}
+
+.activityFile:hover .filePath {
+	color: var(--text-accent);
+	text-decoration: underline;
+}
+
+.changedFileList {
+	min-width: 0;
+}
+
+.revealControls {
+	display: flex;
+	gap: 0.35rem;
+	margin-top: 0.45rem;
+}
+
+.revealControls button {
+	font-size: var(--font-ui-smaller);
+	padding: 0.2rem 0.45rem;
+}
+
+.inlineDiff {
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	margin: 0.4rem 0 0 1.2rem;
+	max-height: 24rem;
+	overflow: auto;
+	padding: 0.35rem;
+}
+
+.comparisonControls {
+	align-items: center;
+	border-bottom: 1px solid var(--background-modifier-border);
+	display: flex;
+	gap: 0.35rem;
+	margin-bottom: 0.5rem;
+	min-width: 0;
+	padding-bottom: 0.5rem;
+}
+
+.comparisonControls button {
+	font-size: var(--font-ui-smaller);
+	padding: 0.2rem 0.45rem;
+}
+
+.previewActions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.4rem;
+	margin-top: 0.65rem;
+}
+
+.previewActions button {
+	font-size: var(--font-ui-smaller);
+}
+
+.issueMessage {
+	overflow-wrap: anywhere;
+	white-space: pre-wrap;
+}
+
+.conflictPath {
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+	margin: 0.25rem 0;
+	overflow-wrap: anywhere;
+}
+
+.conflictExplanation {
+	background: var(--background-secondary);
+	border-left: 3px solid var(--interactive-accent);
+	border-radius: var(--radius-s);
+	font-size: var(--font-ui-small);
+	margin-bottom: 0.75rem;
+	padding: 0.65rem 0.75rem;
+}
+
+.conflictVersions {
+	display: grid;
+	gap: 0.6rem;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.conflictVersion {
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	min-width: 0;
+	padding: 0.65rem;
+}
+
+.conflictVersionDescription {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	margin-top: 0.2rem;
+}
+
+.conflictComparisonTitle {
+	display: block;
+	margin-top: 0.9rem;
+}
+
+.conflictSummary {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	margin: 0.2rem 0 0.35rem;
+}
+
+.conflictDiff {
+	background: var(--background-secondary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	max-height: min(45vh, 30rem);
+	overflow: auto;
+	padding: 0.5rem;
+}
+
+.conflictActions {
+	border-top: 0;
+	margin-top: 0.5rem;
+}
+
+.conflictActionHelp {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	margin-top: 0.7rem;
+}
+
+@media (max-width: 600px) {
+	.conflictVersions {
+		grid-template-columns: minmax(0, 1fr);
+	}
+}
+
+.danger {
+	color: var(--text-error);
+}
+
+.restoreStatus {
+	background: var(--background-secondary);
+	border-left: 3px solid var(--text-muted);
+	border-radius: var(--radius-s);
+	font-size: var(--font-ui-small);
+	margin: 0.25rem 0 0.75rem;
+	overflow-wrap: anywhere;
+	padding: 0.65rem 0.75rem;
+}
+
+.restoreStatus.success {
+	border-left-color: var(--text-success);
+}
+
+.restoreStatus.warning {
+	border-left-color: var(--text-warning);
+}
+
+.restoreStatus.error {
+	border-left-color: var(--text-error);
+}
+
+.restoreStatus details {
+	color: var(--text-muted);
+	margin-top: 0.4rem;
+}
+
+.restoreStatus summary {
+	cursor: pointer;
+}
+
+.restoreDetail {
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+	margin-top: 0.3rem;
+}
+
+@media (max-width: 700px) {
+	.layout {
+		grid-template-columns: 1fr;
+	}
+	.timeline {
+		border-right: 0;
+		border-bottom: 1px solid var(--background-modifier-border);
+		max-height: 14rem;
+	}
+}

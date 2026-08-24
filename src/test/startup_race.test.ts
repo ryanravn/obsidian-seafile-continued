@@ -4,6 +4,9 @@ import { MODE_FILE } from "../server";
 import { SyncController, type NodeChange } from "../sync/controller";
 import { SyncNode } from "../sync/node";
 import type { FileSeafDirent } from "../server";
+import type { App, DataAdapter } from "obsidian";
+import type Server from "../server";
+import type { SeafileSettings } from "../settings";
 
 // Regression test for issue #1: "Bulk delete followed by bulk reupload".
 //
@@ -54,7 +57,7 @@ function makeFakeApp(opts: { indexReady: boolean; onDisk: boolean }) {
 				return null; // index not yet aware of note.md (startup window)
 			},
 		},
-	} as any;
+	} as unknown as App;
 }
 
 async function startupTree() {
@@ -71,14 +74,14 @@ async function startupTree() {
 }
 
 describe("Issue #1: startup race must not delete on-disk files", () => {
-	const settings = { ignore: "", account: "tester" } as any;
+	const settings = { ignore: "", account: "tester" } as unknown as SeafileSettings;
 
 	test("a genuinely deleted file is still removed on the server", async () => {
 		// File absent from BOTH the index and disk -> a real local deletion.
 		// The fix must not suppress these, only the false positives.
 		const app = makeFakeApp({ indexReady: false, onDisk: false });
-		initConfig(app, {} as any, "seafile");
-		const sync = new SyncController(app.vault.adapter, settings);
+		initConfig(app, {} as unknown as Server, "seafile");
+		const sync = new SyncController(app.vault.adapter as unknown as DataAdapter, settings);
 		const fileNode = await startupTree();
 
 		const changes: NodeChange[] = [];
@@ -91,8 +94,8 @@ describe("Issue #1: startup race must not delete on-disk files", () => {
 	test("the fix: a file still on disk is NOT deleted even with an empty index", async () => {
 		// Index hasn't loaded note.md yet, but the file is physically present.
 		const app = makeFakeApp({ indexReady: false, onDisk: true });
-		initConfig(app, {} as any, "seafile");
-		const sync = new SyncController(app.vault.adapter, settings);
+		initConfig(app, {} as unknown as Server, "seafile");
+		const sync = new SyncController(app.vault.adapter as unknown as DataAdapter, settings);
 		const fileNode = await startupTree();
 
 		const changes: NodeChange[] = [];

@@ -4,7 +4,9 @@ import SeafilePlugin from "src/main";
 import { SyncController, SyncStatus } from "src/sync/controller";
 import { SyncNode, SyncState } from "src/sync/node";
 import { debug } from "src/utils";
+import type { NotificationStatus } from "src/notification";
 import styles from "./explorer.module.css";
+import { formatSyncActivity, shouldShowSyncStatusText } from "./sync_progress";
 
 export class Explorer {
 
@@ -18,8 +20,13 @@ export class Explorer {
 			});
 		});
 
-		sync.onNodeStateChanged = node => { void this.nodeStateChanged(node); };
-		sync.onSyncStatusChanged = (status) => this.syncStatusChanged(status);
+		sync.onNodeStateChanged = node => { this.nodeStateChanged(node); };
+		sync.onNodeStatesChanged = nodes => { this.nodeStatesChanged(nodes); };
+		this.plugin.register(sync.subscribeStatus(status => this.syncStatusChanged(status)));
+		this.plugin.register(this.plugin.notifications.subscribeStatus(status => {
+			this.notificationStatus = status;
+			if (this.sync.status.type === "idle") this.syncStatusChanged(this.sync.status);
+		}));
 	}
 
 
@@ -29,7 +36,7 @@ export class Explorer {
 	private statusText: HTMLElement;
 	private statusIcon: HTMLElement;
 	private isRootNodeSynced = false;
-	private isStatusIdle = false;
+	private notificationStatus: NotificationStatus = { type: "disabled" };
 
 	private async registerFileExplorer() {
 		// Find the file explorer
@@ -65,12 +72,9 @@ export class Explorer {
 			void this.fileItemChanged(this.fileItems[path], path);
 		}
 
-		this.statusContainter = activeDocument.createElement("div");
-		this.statusContainter.classList.add(styles.syncStatus);
+		this.statusContainter = this.fileExplorer.containerEl.createDiv({ cls: styles.syncStatus });
 
-		this.statusIcon = activeDocument.createElement("div");
-		this.statusIcon.classList.add("nav-action-button");
-		this.statusIcon.classList.add("clickable-icon");
+		this.statusIcon = this.statusContainter.createDiv({ cls: ["nav-action-button", "clickable-icon"] });
 		this.statusIcon.addEventListener("click", () => {
 			void (async () => {
 				if (!this.plugin.settings.enableSync) {
@@ -79,27 +83,27 @@ export class Explorer {
 					void this.plugin.enableSync();
 				}
 				else {
-					this.plugin.sync.startSync();
+					await this.plugin.triggerManualSync();
 				}
 			})();
 		});
-		this.statusContainter.prepend(this.statusIcon);
-		this.syncStatusChanged(this.sync.status);
-
-		this.statusText = activeDocument.createElement("div");
-		this.statusText.classList.add(styles.syncStatusText);
-		this.statusContainter.appendChild(this.statusText);
+		this.statusText = this.statusContainter.createDiv({ cls: styles.syncStatusText });
 
 		this.fileExplorer.containerEl.getElementsByClassName("nav-files-container")[0].after(this.statusContainter);
+		this.syncStatusChanged(this.sync.status);
 	}
 
 	private statesBuffer: Map<string, SyncState> = new Map();
-	private async nodeStateChanged(node: SyncNode) {
+	private nodeStatesChanged(nodes: SyncNode[]): void {
+		for (const node of nodes) this.nodeStateChanged(node);
+	}
+
+	private nodeStateChanged(node: SyncNode): void {
 		const path = node.path === "" ? "/" : node.path.slice(1); // remove leading slash
 
 		const item = this.fileItems[path];
 		if (item) {
-			await this.renderFileItem(item, node.state);
+			this.renderFileItem(item, node.state);
 		}
 		else {
 			this.statesBuffer.set(path, node.state);
@@ -109,42 +113,47 @@ export class Explorer {
 		if (path === "/") {
 			this.isRootNodeSynced = node.state.type === "sync";
 
-			if (!this.isRootNodeSynced && this.isStatusIdle) {
-				this.setStatus("history", "Pending sync");
+			// Node state changes also occur while a sync is running. Only derive
+			// the summary from the root node while the controller is actually
+			// idle, otherwise this would overwrite Downloading/Uploading with a
+			// stale Pending sync status.
+			if (this.sync.status.type === "idle") {
+				this.syncStatusChanged(this.sync.status);
 			}
 		}
 	}
 
-	private async fileItemChanged(item: FileItem, path: string) {
+	private fileItemChanged(item: FileItem, path: string): void {
 		if (this.statesBuffer.has(path)) {
-			await this.renderFileItem(item, this.statesBuffer.get(path)!);
+			this.renderFileItem(item, this.statesBuffer.get(path)!);
 		}
 		else {
-			await this.renderFileItem(item, { type: "init" });
+			this.renderFileItem(item, { type: "init" });
 		}
 	}
 
-	private async renderFileItem(item: FileItem, state: SyncState) {
+	private renderFileItem(item: FileItem, state: SyncState): void {
 		if (!item.iconWrapper) {
 			// Create icon wrapper div
-			const iconWrapper = activeDocument.createElement("div");
-			iconWrapper.classList.add(styles.nodeState);
-			item.selfEl.appendChild(iconWrapper);
+			const iconWrapper = item.selfEl.createDiv({ cls: styles.nodeState });
 			item.iconWrapper = iconWrapper;
 		}
 
 		const wrapper = item.iconWrapper;
+		setTooltip(wrapper, "");
 		if (state.type === "sync") {
 			wrapper.textContent = "";
 		}
 		else if (state.type === "upload") {
 			setIcon(wrapper, "upload-cloud");
+			setTooltip(wrapper, `Uploading — ${Math.round(state.param.progress * 100)}%`);
 		}
 		else if (state.type === "init") {
 			setIcon(wrapper, "refresh-cw");
 		}
 		else if (state.type === "download") {
 			setIcon(wrapper, "download-cloud");
+			setTooltip(wrapper, `Downloading — ${Math.round(state.param * 100)}%`);
 		}
 		else if (state.type === "delete") {
 			// don't show delete: may be overwrite rename if delete is delayed after create event
@@ -152,34 +161,57 @@ export class Explorer {
 		wrapper.setAttribute("state", state.type);
 	}
 
-	setStatus(icon: string, text: string) {
+	setStatus(icon: string, text: string, visibleText = text) {
 		setIcon(this.statusIcon, icon);
 		setTooltip(this.statusIcon, text, { placement: "right" });
+		this.statusText.textContent = visibleText;
+	}
+
+	private withRealtimeStatus(text: string): string {
+		if (!this.plugin.settings.enableNotifications) return `${text} — realtime disabled`;
+		if (this.notificationStatus.type === "connected") return `${text} — realtime connected`;
+		if (this.notificationStatus.type === "connecting") return `${text} — realtime connecting`;
+		if (this.notificationStatus.type === "fallback") return `${text} — periodic fallback active`;
+		return text;
 	}
 
 	syncStatusChanged(status: SyncStatus): void {
 		if (!this.statusIcon) return;
 
 		if (status.type == "idle") {
-			this.isStatusIdle = true;
-			if (this.isRootNodeSynced) {
-				this.setStatus("check", "Synced");
+			if (status.error) {
+				this.setStatus("alert-circle", this.withRealtimeStatus(`Sync failed: ${status.error} — retry scheduled`), "Sync failed — retry scheduled");
+			}
+			else if (this.isRootNodeSynced) {
+				this.setStatus("check", this.withRealtimeStatus("Synced"));
 			}
 			else {
-				this.setStatus("history", "Pending sync");
+				this.setStatus("history", this.withRealtimeStatus("Pending sync"));
 			}
 		}
 		else if (status.type == "busy") {
+			const activity = formatSyncActivity(status);
 			if (status.message == "fetch" || status.message == "download") {
-				this.setStatus("download-cloud", "Downloading");
+				this.setStatus("download-cloud", activity);
 			}
 			else if (status.message == "upload") {
-				this.setStatus("upload-cloud", "Uploading");
+				this.setStatus("upload-cloud", activity);
+			}
+			else {
+				// syncCycle enters busy before it knows which phase comes next, so
+				// provide immediate feedback for manual sync clicks.
+				this.setStatus("refresh-cw", activity);
 			}
 		}
 		else if (status.type == "stop") {
-			if (status.message == "error") {
+			if (status.message == "repository-unavailable") {
+				this.setStatus("archive-x", `${status.error ?? "Repository unavailable"} Local files preserved.`);
+			}
+			else if (status.message == "error") {
 				this.setStatus("alert-circle", "Error");
+			}
+			else if (status.message == "safety" || status.message == "preflight") {
+				this.setStatus("shield-alert", status.error ?? "Sync paused by a safety check");
 			}
 			else {
 				this.setStatus("refresh-cw-off", "Sync stopped");
@@ -188,6 +220,9 @@ export class Explorer {
 		else {
 			throw new Error("Invalid sync status type");
 		}
+		// Persistent label visibility is independent from the icon tooltip,
+		// which setStatus() always updates with the complete status text.
+		this.statusText.hidden = !shouldShowSyncStatusText(this.plugin.settings.syncStatusTextMode, status);
 	}
 
 	onPluginUnload() {
