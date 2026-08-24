@@ -56,4 +56,21 @@ describe("sync issue store", () => {
 		expect(store.add({ kind: "error", message: transient[0] })).toBeNull();
 		expect(shouldSurfaceSyncIssue({ kind: "error", message: "Authentication failed repeatedly" })).toBe(true);
 	});
+
+	test("migrates fork issue data into the upstream storage namespace", () => {
+		const legacyIssue: SyncIssue = {
+			id: "legacy", kind: "conflict", message: "Preserved conflict", createdAt: 1,
+			lastSeenAt: 1, occurrences: 1, resolved: false
+		};
+		const storage = new Map<string, unknown>([["seafile-improved-sync-issues", [legacyIssue]]]);
+		const app = {
+			loadLocalStorage: (key: string) => storage.get(key) ?? null,
+			saveLocalStorage: (key: string, value: unknown) => { storage.set(key, value); }
+		} as unknown as App;
+		const store = new SyncIssueStore(app);
+
+		expect(store.list()).toEqual([legacyIssue]);
+		store.add({ kind: "error", message: "New issue" });
+		expect(storage.has("seafile-continued-sync-issues")).toBe(true);
+	});
 });

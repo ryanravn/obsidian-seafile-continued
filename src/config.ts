@@ -30,7 +30,7 @@ export function initConfig(app_: App, server_: Server, pluginId: string, setting
 	DEFAULT_SEAFILE_IGNORE = createDefaultIgnoreFile(app.vault.configDir, pluginId, settings);
 }
 
-export const PLUGIN_GITIGNORE_CONTENT = "head_commit\nsync_data\nsync_dlog\ndownload_staging\nhistory\n";
+export const PLUGIN_GITIGNORE_CONTENT = "head_commit\nsync_data\nsync_dlog\ndownload_journal\ndownload_staging\nhistory\n";
 
 export async function ensurePluginGitignore(): Promise<void> {
 	if (!await adapter.exists(PLUGIN_GITIGNORE_PATH)) {
