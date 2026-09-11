@@ -7,6 +7,7 @@ import prettyBytes from "pretty-bytes";
 export interface SelectedRepo {
   repoName: string
   repoId: string
+	permission: string
   info: RepoDownloadInfo
 }
 
@@ -22,7 +23,7 @@ export default class RepoModal extends Modal {
 	async loadRepoToken(repo: Repo): Promise<boolean> {
 		try {
 			const info = await server.getRepoDownloadInfo(repo.repo_id);
-			await this.callback({ repoName: repo.repo_name, repoId: repo.repo_id, info });
+			await this.callback({ repoName: repo.repo_name, repoId: repo.repo_id, permission: repo.permission, info });
 			return true;
 		}
 		catch (error) {
@@ -38,7 +39,7 @@ export default class RepoModal extends Modal {
 		for (const repo of repoList) {
 			new Setting(contentEl)
 				.setName(repo.repo_name)
-				.setDesc(`Size: ${prettyBytes(repo.size)}. Last modified: ${new Date(repo.last_modified).toLocaleString()}.`)
+				.setDesc(`Access: ${repo.permission === "rw" ? "read and write" : "read only"}. Size: ${prettyBytes(repo.size)}. Last modified: ${new Date(repo.last_modified).toLocaleString()}.`)
 				.addButton(button => button.onClick(async () => {
 					button.setDisabled(true);
 					const selected = await this.loadRepoToken(repo);

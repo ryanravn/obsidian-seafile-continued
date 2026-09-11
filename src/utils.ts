@@ -3,6 +3,9 @@ import pThrottle from "p-throttle";
 import { posix as Path } from "path-browserify";
 import { type Commit, type SeafFs } from "./server";
 import * as config from "./config";
+
+export const SEAFILE_BLOCK_SIZE = 8 * 1024 * 1024;
+
 export class FormData {
 	private readonly boundary: string;
 	private readonly data: unknown[];
@@ -81,10 +84,10 @@ export function memoizeWithLimit<T extends unknown[], V>(fn: Func<T, V>, cacheLi
 
 // Pack multiple requests into a single request
 export function packRequest<FuncParamType, FuncRetType>
-	(
-		packFunc: (funcParamArray: FuncParamType[]) => Promise<Map<FuncParamType, FuncRetType>>,
-		limit: number, interval: number, batchSize: number
-	): (key: FuncParamType) => Promise<FuncRetType> {
+(
+	packFunc: (funcParamArray: FuncParamType[]) => Promise<Map<FuncParamType, FuncRetType>>,
+	limit: number, interval: number, batchSize: number
+): (key: FuncParamType) => Promise<FuncRetType> {
 	interface callback { resolve: (value: FuncRetType) => void, reject: (reason: unknown) => void }
 	const taskQueue = new Map<FuncParamType, Array<{ callback: callback, stack: string }>>();
 	const throttled = pThrottle({ limit, interval })(async () => {
@@ -192,7 +195,7 @@ export async function computeBlocks(buffer: ArrayBuffer): Promise<Record<string,
 	const size = buffer.byteLength;
 
 	const blocks: Record<string, ArrayBuffer> = {};
-	const blockSize = 8 * 1024 * 1024; // 8MB
+	const blockSize = SEAFILE_BLOCK_SIZE;
 	const numBlocks = Math.ceil(size / blockSize);
 	for (let i = 0; i < numBlocks; i++) {
 		const block = buffer.slice(i * blockSize, (i + 1) * blockSize);
@@ -208,7 +211,7 @@ export async function computeBlocks(buffer: ArrayBuffer): Promise<Record<string,
 export async function computeBlocksEncrypted(buffer: ArrayBuffer, encrypt: (chunk: ArrayBuffer) => Promise<ArrayBuffer>): Promise<Record<string, ArrayBuffer>> {
 	const size = buffer.byteLength;
 	const blocks: Record<string, ArrayBuffer> = {};
-	const blockSize = 8 * 1024 * 1024;
+	const blockSize = SEAFILE_BLOCK_SIZE;
 	const numBlocks = Math.ceil(size / blockSize);
 	for (let i = 0; i < numBlocks; i++) {
 		const plain = buffer.slice(i * blockSize, (i + 1) * blockSize);

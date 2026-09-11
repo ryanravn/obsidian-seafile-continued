@@ -8,6 +8,7 @@ import * as utils from "./utils";
 import pako from "pako";
 import { posix as Path } from "path-browserify";
 import { type RepoCrypto } from "./crypto";
+import type { DeletedEntry, FileRevision, LibraryRevision, SnapshotEntry } from "./history/types";
 
 export const ZeroFs = "0000000000000000000000000000000000000000";
 export type SeafFs = FileSeafFs | DirSeafFs
@@ -60,6 +61,7 @@ export class RequestParam {
 	body?: string | ArrayBuffer;
 	headers?: Record<string, string>;
 	retry?: number;
+	timeoutMs?: number;
 }
 
 // Normalized response surface returned by the low-level request layer, so the
@@ -135,16 +137,87 @@ export interface DirInfo {
 export interface CommitChanges {
   addedFiles: string[]
   removedFiles: string[]
-  renamedFiles: string[]
+  renamedFiles: Array<{ from: string, to: string }>
   modifiedFiles: string[]
   addedDirectories: string[]
   removedDirectories: string[]
-  renamedDirectories: string[]
+  renamedDirectories: Array<{ from: string, to: string }>
 }
 
 export class MfaRequiredError extends Error {
 	constructor() {
 		super("Two-factor authentication token is required.");
+	}
+}
+
+export class HttpError extends Error {
+	constructor(
+		public readonly status: number,
+		public readonly response: unknown,
+		public readonly requestContext = ""
+	) {
+		super(`HTTP ${status}${requestContext ? ` during ${requestContext}` : ""}: ${formatHttpErrorResponse(response)}`);
+	}
+}
+
+function formatHttpErrorResponse(response: unknown): string {
+	if (response && typeof response === "object") {
+		const record = response as Record<string, unknown>;
+		for (const field of ["error_msg", "error", "detail", "message"] as const) {
+			if (typeof record[field] === "string" && record[field].trim()) {
+				return truncateErrorDetail(record[field].trim());
+			}
+		}
+	}
+	if (typeof response === "string") {
+		const text = response.trim();
+		if (/<(?:!doctype\s+html|html|body)(?:\s|>)/i.test(text)) {
+			const title = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(text)?.[1]
+				?.replace(/<[^>]+>/g, " ")
+				.replace(/\s+/g, " ")
+				.trim();
+			return title
+				? `Server returned an HTML error page (${truncateErrorDetail(title)}).`
+				: "Server returned an HTML error page.";
+		}
+		return text ? truncateErrorDetail(text) : "Empty response.";
+	}
+	if (response === null || response === undefined) return "Empty response.";
+	try {
+		return truncateErrorDetail(JSON.stringify(response));
+	} catch {
+		return "Unrecognized response.";
+	}
+}
+
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function isUnknownArray(value: unknown): value is unknown[] {
+	return Array.isArray(value);
+}
+
+function truncateErrorDetail(detail: string, maxLength = 300): string {
+	return detail.length <= maxLength ? detail : `${detail.slice(0, maxLength - 1)}…`;
+}
+
+function formatHttpRequestContext(req: RequestUrlParam & RequestParam): string {
+	let path: string;
+	try {
+		path = new URL(req.url).pathname;
+	} catch {
+		path = req.url.split(/[?#]/, 1)[0];
+	}
+	path = path
+		.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "{id}")
+		.replace(/[0-9a-f]{40,64}/gi, "{object}");
+	return `${req.method ?? "GET"} ${path}`;
+}
+
+export class RepositoryUnavailableError extends Error {
+	constructor(public readonly status: number) {
+		super("The configured Seafile repository no longer exists or is no longer accessible.");
 	}
 }
 
@@ -158,7 +231,10 @@ export interface RepoDownloadInfo {
 }
 
 export default class Server {
+	private static readonly REQUEST_TIMEOUT_MS = 120 * 1000;
+	private static readonly FS_PACK_YIELD_INTERVAL = 25;
 	public crypto: RepoCrypto | null = null;
+	private readonly libraryRevisionCache = new Map<string, LibraryRevision>();
 
 	public constructor (private readonly settings: SeafileSettings,
     private readonly plugin: SeafilePlugin
@@ -166,9 +242,13 @@ export default class Server {
 	}
 
 	private async request (req: RequestUrlParam & RequestParam): Promise<RequestResponse> {
+		const timeoutMs = req.timeoutMs ?? Server.REQUEST_TIMEOUT_MS;
 		if(!this.settings.useFetch)
 		{
-			const response = await pTimeout(requestUrl(req), { milliseconds: 120 * 1000 });
+			const response = await pTimeout(requestUrl(req), {
+				milliseconds: timeoutMs,
+				message: `Seafile request timed out after ${timeoutMs / 1000} seconds.`
+			});
 			return {
 				status: response.status,
 				text: () => Promise.resolve(response.text),
@@ -179,16 +259,35 @@ export default class Server {
 		else
 		{
 			// Intentional opt-in alternative to requestUrl, gated by settings.useFetch.
-			const response = await window.fetch(req.url, {
+			const controller = new AbortController();
+			const headers = { ...(req.headers ?? {}) };
+			if (req.contentType && !Object.keys(headers).some(name => name.toLowerCase() === "content-type")) {
+				headers["Content-Type"] = req.contentType;
+			}
+			const withTimeout = async <T>(task: () => Promise<T>): Promise<T> => {
+				const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+				try {
+					return await task();
+				} catch (error) {
+					if (controller.signal.aborted) {
+						throw new Error(`Seafile request timed out after ${timeoutMs / 1000} seconds.`);
+					}
+					throw error;
+				} finally {
+					window.clearTimeout(timeoutId);
+				}
+			};
+			const response = await withTimeout(async () => await window.fetch(req.url, {
 				method: req.method,
-				headers: req.headers,
+				headers,
 				body: req.body,
-			});
+				signal: controller.signal,
+			}));
 			return {
 				status: response.status,
-				text: () => response.text(),
-				json: () => response.json() as Promise<unknown>,
-				arrayBuffer: () => response.arrayBuffer()
+				text: async () => await withTimeout(async () => await response.text()),
+				json: async () => await withTimeout(async () => await response.json() as unknown),
+				arrayBuffer: async () => await withTimeout(async () => await response.arrayBuffer())
 			};
 		}
 	}
@@ -197,10 +296,10 @@ export default class Server {
 	private async sendRequest (param: RequestParam): Promise<unknown> {
 		const req: RequestUrlParam & RequestParam = { ...param };
 		req.throw = false;
-		req.retry = req.retry || 1;
+		req.retry = req.retry ?? 1;
 		req.method = req.method || "GET";
 
-		const resp = await pRetry(async () => await this.requestThrottled(req), { retries: param.retry });
+		const resp = await pRetry(async () => await this.requestThrottled(req), { retries: req.retry });
 		const status = resp.status.toString();
 		let ret: unknown = null;
 
@@ -209,13 +308,19 @@ export default class Server {
 		} else if (req.responseType === "binary") {
 			ret = await resp.arrayBuffer();
 		} else {
-			const json = await resp.json() as { error_msg?: string };
-			ret = json;
-			if (json.error_msg) { throw new Error(json.error_msg); }
+			const text = await resp.text();
+			try {
+				ret = JSON.parse(text) as unknown;
+			} catch {
+				ret = text;
+			}
 		}
 
-		if (!status.startsWith("2") && !status.startsWith("3")) {
-			throw new Error(`HTTP ${status}. Response: ${JSON.stringify(ret)}`);
+		if (!status.startsWith("2")) {
+			throw new HttpError(resp.status, ret, formatHttpRequestContext(req));
+		}
+		if (ret && typeof ret === "object" && "error_msg" in ret && typeof ret.error_msg === "string") {
+			throw new Error(ret.error_msg);
 		}
 
 		return ret;
@@ -227,6 +332,35 @@ export default class Server {
 		req.url = `${this.settings.host}/seafhttp/${req.url}`;
 
 		return await this.sendRequest(req);
+	}
+
+	async checkNotificationServer(notificationUrl: string): Promise<void> {
+		const response = await this.sendRequest({
+			url: `${notificationUrl.replace(/\/+$/, "")}/ping`,
+			responseType: "text",
+			retry: 0
+		}) as string;
+		let data: { ret?: unknown };
+		try {
+			data = JSON.parse(response) as { ret?: unknown };
+		} catch {
+			throw new Error("Notification server returned an unexpected ping response.");
+		}
+		if (data.ret !== "pong") {
+			throw new Error("Notification server did not answer the ping request.");
+		}
+	}
+
+	async getNotificationJwtToken(repoId: string): Promise<string> {
+		const response = await this.requestSeafHttp({
+			url: `repo/${encodeURIComponent(repoId)}/jwt-token`,
+			responseType: "json",
+			retry: 0
+		}) as { jwt_token?: unknown };
+		if (typeof response.jwt_token !== "string" || !response.jwt_token) {
+			throw new Error("Seafile did not return a notification token.");
+		}
+		return response.jwt_token;
 	}
 
 	async requestAPIv20 (req: RequestParam) {
@@ -359,15 +493,36 @@ export default class Server {
 	}
 
 	async getRepoList (): Promise<Repo[]> {
+		return await this.getRepoListWithToken(this.settings.authToken);
+	}
+
+	async getRepoPermission(repoId: string = this.settings.repoId): Promise<string> {
+		const repo = (await this.getRepoList()).find(item => item.repo_id === repoId);
+		if (!repo) throw new RepositoryUnavailableError(404);
+		return repo.permission;
+	}
+
+	async validateAuthToken(authToken: string): Promise<void> {
+		const token = authToken.trim();
+		if (!token) throw new Error("API token is required.");
+
+		await this.getRepoListWithToken(token);
+	}
+
+	private async getRepoListWithToken(authToken: string): Promise<Repo[]> {
 		const resp = await this.sendRequest({
 			url: `${this.settings.host}/api/v2.1/repos/`,
 			headers: {
-				Authorization: `Token ${this.settings.authToken}`
+				Authorization: `Token ${authToken}`
 			},
 			responseType: "json"
-		}) as { repos: Repo[] };
+		}) as { repos?: unknown };
 
-		return resp.repos;
+		if (!Array.isArray(resp.repos)) {
+			throw new Error("The server returned an unexpected repository response.");
+		}
+
+		return resp.repos as Repo[];
 	}
 
 	async getRepoToken (repoId: string): Promise<string> {
@@ -410,6 +565,258 @@ export default class Server {
 		const fileDownloadLink = await this.getFileDownloadLink(remotePath);
 		const downloadResp = await this.request({ url: fileDownloadLink, method: "GET", responseType: "binary", throw: false });
 		return downloadResp.arrayBuffer();
+	}
+
+	async getFileHistory(remotePath: string, startCommit = "", limit = 50): Promise<{ revisions: FileRevision[], nextCommit: string | null }> {
+		const indexedPage = startCommit.startsWith("indexed-page:")
+			? Number(startCommit.slice("indexed-page:".length))
+			: startCommit ? null : 1;
+		if (indexedPage !== null && Number.isInteger(indexedPage) && indexedPage > 0) {
+			try {
+				return await this.getIndexedFileHistory(remotePath, indexedPage, limit);
+			} catch (error) {
+				const canUseLegacyEndpoint = indexedPage === 1
+					&& error instanceof HttpError
+					&& [404, 405, 500, 501].includes(error.status);
+				if (!canUseLegacyEndpoint) throw error;
+				utils.debug.warn("[Seafile Improved] Indexed file history is unavailable; using the compatibility endpoint.", {
+					status: error.status,
+					request: error.requestContext
+				});
+			}
+		}
+		return await this.getLegacyFileHistory(remotePath, startCommit, limit);
+	}
+
+	private async getIndexedFileHistory(remotePath: string, page: number, perPage: number): Promise<{ revisions: FileRevision[], nextCommit: string | null }> {
+		const query = new URLSearchParams({ path: remotePath, page: String(page), per_page: String(perPage) });
+		const response = await this.requestAPIv21({
+			url: `repos/${this.settings.repoId}/file/new_history/?${query.toString()}`,
+			retry: 0,
+			timeoutMs: 15 * 1000
+		}) as {
+			data?: Array<{
+				commit_id?: unknown, path?: unknown, ctime?: unknown, creator_name?: unknown,
+				creator_email?: unknown, op_type?: unknown, size?: unknown, rev_file_id?: unknown,
+				old_path?: unknown
+			}>,
+			total_count?: unknown
+		};
+		const revisions = this.parseFileHistoryRevisions(response.data, remotePath, true);
+		const totalCount = typeof response.total_count === "number"
+			? response.total_count
+			: Number(response.total_count);
+		const hasMore = Number.isFinite(totalCount)
+			? page * perPage < totalCount
+			: revisions.length === perPage;
+		return { revisions, nextCommit: hasMore ? `indexed-page:${page + 1}` : null };
+	}
+
+	private async getLegacyFileHistory(remotePath: string, startCommit: string, limit: number): Promise<{ revisions: FileRevision[], nextCommit: string | null }> {
+		const query = new URLSearchParams({ path: remotePath, limit: String(limit) });
+		if (startCommit) query.set("commit_id", startCommit);
+		const response = await this.requestAPIv21({
+			url: `repos/${this.settings.repoId}/file/history/?${query.toString()}`,
+			retry: 0,
+			timeoutMs: 15 * 1000
+		}) as {
+			data?: Array<{
+				commit_id?: unknown, path?: unknown, ctime?: unknown, creator_name?: unknown,
+				creator_email?: unknown, description?: unknown, size?: unknown, rev_file_id?: unknown,
+				rev_renamed_old_path?: unknown
+			}>,
+			next_start_commit?: unknown
+		};
+
+		const revisions = this.parseFileHistoryRevisions(response.data, remotePath);
+		return {
+			revisions,
+			nextCommit: typeof response.next_start_commit === "string" && response.next_start_commit
+				? response.next_start_commit
+				: null
+		};
+	}
+
+	private parseFileHistoryRevisions(
+		data: Array<{
+			commit_id?: unknown, path?: unknown, ctime?: unknown, creator_name?: unknown,
+			creator_email?: unknown, description?: unknown, op_type?: unknown, size?: unknown,
+			rev_file_id?: unknown, rev_renamed_old_path?: unknown, old_path?: unknown
+		}> | undefined,
+		remotePath: string,
+		indexed = false
+	): FileRevision[] {
+		return (data ?? []).flatMap(item => {
+			if (typeof item.commit_id !== "string" || typeof item.ctime !== "string") return [];
+			return [{
+				commitId: item.commit_id,
+				path: typeof item.path === "string" ? item.path : remotePath,
+				createdAt: Date.parse(item.ctime),
+				authorName: typeof item.creator_name === "string" ? item.creator_name : "",
+				authorEmail: typeof item.creator_email === "string" ? item.creator_email : "",
+				description: typeof item.description === "string"
+					? item.description
+					: indexed && typeof item.op_type === "string" ? item.op_type : "",
+				size: typeof item.size === "number" ? item.size : Number(item.size) || 0,
+				fileId: typeof item.rev_file_id === "string" ? item.rev_file_id : "",
+				renamedFrom: typeof item.rev_renamed_old_path === "string" && item.rev_renamed_old_path
+					? item.rev_renamed_old_path
+					: typeof item.old_path === "string" && item.old_path ? item.old_path : undefined
+			}];
+		});
+	}
+
+	async getLibraryHistory(page = 1, perPage = 50): Promise<{ revisions: LibraryRevision[], more: boolean }> {
+		const query = new URLSearchParams({ page: String(page), per_page: String(perPage) });
+		const response = await this.requestAPIv21({
+			url: `repos/${this.settings.repoId}/history/?${query.toString()}`
+		}) as {
+			data?: Array<{
+				commit_id?: unknown, time?: unknown, name?: unknown, email?: unknown, description?: unknown,
+				client_version?: unknown, device_name?: unknown, second_parent_id?: unknown, tags?: unknown
+			}>,
+			more?: unknown
+		};
+		const revisions = (response.data ?? []).flatMap(item => {
+			if (typeof item.commit_id !== "string" || typeof item.time !== "string") return [];
+			return [{
+				commitId: item.commit_id,
+				createdAt: Date.parse(item.time),
+				authorName: typeof item.name === "string" ? item.name : "",
+				authorEmail: typeof item.email === "string" ? item.email : "",
+				description: typeof item.description === "string" ? item.description : "",
+				clientVersion: typeof item.client_version === "string" ? item.client_version : "",
+				deviceName: typeof item.device_name === "string" ? item.device_name : "",
+				secondParentId: typeof item.second_parent_id === "string" && item.second_parent_id ? item.second_parent_id : undefined,
+				tags: Array.isArray(item.tags) ? item.tags.filter((tag): tag is string => typeof tag === "string") : []
+			}];
+		});
+		for (const revision of revisions) this.libraryRevisionCache.set(revision.commitId, revision);
+		return { revisions, more: response.more === true };
+	}
+
+	getCachedLibraryRevision(commitId: string): LibraryRevision | undefined {
+		return this.libraryRevisionCache.get(commitId);
+	}
+
+	async getSnapshotDirectory(commitId: string, remotePath = "/"): Promise<SnapshotEntry[]> {
+		const query = new URLSearchParams({ path: remotePath });
+		const response = await this.requestAPIv21({
+			url: `repos/${this.settings.repoId}/commits/${encodeURIComponent(commitId)}/dir/?${query.toString()}`
+		}) as {
+			dirent_list?: Array<{ type?: unknown, parent_dir?: unknown, obj_id?: unknown, name?: unknown, size?: unknown }>
+		};
+		return (response.dirent_list ?? []).flatMap(item => {
+			if ((item.type !== "file" && item.type !== "dir") || typeof item.name !== "string" || typeof item.obj_id !== "string") return [];
+			return [{
+				type: item.type,
+				parentDir: typeof item.parent_dir === "string" ? item.parent_dir : remotePath,
+				name: item.name,
+				objectId: item.obj_id,
+				size: typeof item.size === "number" ? item.size : Number(item.size) || 0
+			}];
+		});
+	}
+
+	async getDeletedEntries(page = 1, perPage = 100): Promise<{ entries: DeletedEntry[], totalCount: number }> {
+		const query = new URLSearchParams({ page: String(page), per_page: String(perPage) });
+		const response = await this.requestAPIv21({
+			url: `repos/${this.settings.repoId}/trash2/?${query.toString()}`
+		}) as {
+			items?: Array<{
+				parent_dir?: unknown, obj_name?: unknown, deleted_time?: unknown, commit_id?: unknown,
+				is_dir?: unknown, size?: unknown, obj_id?: unknown
+			}>,
+			total_count?: unknown
+		};
+		const entries = (response.items ?? []).flatMap(item => {
+			if (typeof item.obj_name !== "string" || typeof item.commit_id !== "string" || typeof item.deleted_time !== "string") return [];
+			return [{
+				parentDir: typeof item.parent_dir === "string" ? item.parent_dir : "/",
+				name: item.obj_name,
+				deletedAt: Date.parse(item.deleted_time),
+				commitId: item.commit_id,
+				isDirectory: item.is_dir === true,
+				size: typeof item.size === "number" ? item.size : Number(item.size) || 0,
+				objectId: typeof item.obj_id === "string" ? item.obj_id : ""
+			}];
+		});
+		return { entries, totalCount: typeof response.total_count === "number" ? response.total_count : entries.length };
+	}
+
+	async restoreDeletedEntries(entries: Array<{ commitId: string, path: string }>): Promise<{ success: string[], failed: Array<{ path: string, error: string }> }> {
+		const grouped: Record<string, string[]> = {};
+		for (const entry of entries) (grouped[entry.commitId] ??= []).push(entry.path);
+		try {
+			const response = await this.requestAPIv21({
+				url: `repos/${this.settings.repoId}/trash2/revert/`,
+				method: "POST",
+				body: JSON.stringify(grouped),
+				contentType: "application/json"
+			});
+			return this.parseDeletedRestoreResponse(response);
+		} catch (error) {
+			if (!this.isMissingTrash2RestoreEndpoint(error)) throw error;
+			utils.debug.warn("[Seafile Improved] Modern trash restore endpoint is unavailable; using the compatibility endpoint.", {
+				status: error.status,
+				request: error.requestContext
+			});
+			return await this.restoreDeletedEntriesCompatibility(grouped);
+		}
+	}
+
+	private isMissingTrash2RestoreEndpoint(error: unknown): error is HttpError {
+		if (!(error instanceof HttpError) || ![404, 405].includes(error.status)) return false;
+		if (error.status === 405) return true;
+		return typeof error.response === "string" && /<(?:!doctype\s+html|html|body)(?:\s|>)/i.test(error.response);
+	}
+
+	private async restoreDeletedEntriesCompatibility(grouped: Record<string, string[]>): Promise<{ success: string[], failed: Array<{ path: string, error: string }> }> {
+		const result: { success: string[], failed: Array<{ path: string, error: string }> } = { success: [], failed: [] };
+		for (const [commitId, paths] of Object.entries(grouped)) {
+			const body = new URLSearchParams();
+			for (const path of paths) body.append("path", path);
+			body.append("commit_id", commitId);
+			try {
+				const response = await this.requestAPIv21({
+					url: `repos/${this.settings.repoId}/trash/revert-dirents/`,
+					method: "POST",
+					body: body.toString(),
+					contentType: "application/x-www-form-urlencoded"
+				});
+				const restored = this.parseDeletedRestoreResponse(response);
+				result.success.push(...restored.success);
+				result.failed.push(...restored.failed);
+			} catch (error) {
+				utils.debug.error("[Seafile Improved] Deleted-item compatibility restore failed.", {
+					commitId,
+					paths,
+					error
+				});
+				const message = error instanceof Error ? error.message : String(error);
+				result.failed.push(...paths.map(path => ({ path, error: message })));
+			}
+		}
+		return result;
+	}
+
+	private parseDeletedRestoreResponse(response: unknown): { success: string[], failed: Array<{ path: string, error: string }> } {
+		const payload = isUnknownRecord(response) ? response : {};
+		const successItems = isUnknownArray(payload.success) ? payload.success : [];
+		const failedItems = isUnknownArray(payload.failed) ? payload.failed : [];
+		const success: string[] = [];
+		const failed: Array<{ path: string, error: string }> = [];
+		for (const item of successItems) {
+			if (isUnknownRecord(item) && typeof item.path === "string") success.push(item.path);
+		}
+		for (const item of failedItems) {
+			if (!isUnknownRecord(item) || typeof item.path !== "string") continue;
+			failed.push({
+				path: item.path,
+				error: typeof item.error_msg === "string" ? item.error_msg : "Restore failed"
+			});
+		}
+		return { success, failed };
 	}
 
 	async renameFile (oldPath: string, newName: string) {
@@ -537,8 +944,15 @@ export default class Server {
 	}
 
 	async getHeadCommitId (): Promise<string> {
-		const resp = await this.requestSeafHttp({ url: `repo/${this.settings.repoId}/commit/HEAD` }) as { head_commit_id: string };
-		return resp.head_commit_id;
+		try {
+			const resp = await this.requestSeafHttp({ url: `repo/${this.settings.repoId}/commit/HEAD` }) as { head_commit_id: string };
+			return resp.head_commit_id;
+		} catch (error) {
+			if (error instanceof HttpError && [403, 404, 444].includes(error.status)) {
+				throw new RepositoryUnavailableError(error.status);
+			}
+			throw error;
+		}
 	}
 
 	getCommitInfo = utils.memoizeWithLimit(async (commit: string) => {
@@ -616,7 +1030,8 @@ export default class Server {
 			summary += "Deleted " + formatChange(changes.removedFiles.length, changes.removedFiles[0]);
 		}
 		if (changes.renamedFiles.length > 0) {
-			summary += "Renamed " + formatChange(changes.renamedFiles.length, changes.renamedFiles[0]);
+			const first = changes.renamedFiles[0];
+			summary += `Renamed "${first.from}" to "${first.to}"${changes.renamedFiles.length > 1 ? ` and ${changes.renamedFiles.length - 1} more files` : ""}.\n`;
 		}
 		if (changes.addedDirectories.length > 0) {
 			summary += "Added " + formatChange(changes.addedDirectories.length, changes.addedDirectories[0], true);
@@ -625,7 +1040,8 @@ export default class Server {
 			summary += "Removed " + formatChange(changes.removedDirectories.length, changes.removedDirectories[0], true);
 		}
 		if (changes.renamedDirectories.length > 0) {
-			summary += "Renamed " + formatChange(changes.renamedDirectories.length, changes.renamedDirectories[0], true);
+			const first = changes.renamedDirectories[0];
+			summary += `Renamed directory "${first.from}" to "${first.to}"${changes.renamedDirectories.length > 1 ? ` and ${changes.renamedDirectories.length - 1} more directories` : ""}.\n`;
 		}
 
 		return summary.trim();
@@ -681,13 +1097,15 @@ export default class Server {
 		utils.packRequest<string, SeafFsResult>((fsList: string[]) => this.getPackFs(fsList), 10, 200, 100)
 		, 1000);
 
-	async sendPackFs (fsList: SeafFsResult[]): Promise<Map<SeafFsResult, boolean>> {
+	async sendPackFs (fsList: SeafFsResult[], onProgress?: (completedItems: number, totalItems: number) => void): Promise<Map<SeafFsResult, boolean>> {
 		const result = new Map<SeafFsResult, boolean>();
 
 		// Prepare fs data
 		const utf8Encoder = new TextEncoder();
-		let data = new Uint8Array();
-		for (const task of fsList) {
+		const chunks: Uint8Array[] = [];
+		let totalSize = 0;
+		for (let index = 0; index < fsList.length; index++) {
+			const task = fsList[index];
 			const [fsId, fs] = task;
 			if (!fs) {
 				result.set(task, false);
@@ -702,8 +1120,22 @@ export default class Server {
 				combinedData.set(new Uint8Array(idData), 0);
 				combinedData.set(new Uint8Array(sizeBuffer), idData.byteLength);
 				combinedData.set(new Uint8Array(compressed), idData.byteLength + sizeBuffer.byteLength);
-				data = utils.concatTypedArrays(data, combinedData);
+				chunks.push(combinedData);
+				totalSize += combinedData.byteLength;
 			}
+			const completedItems = index + 1;
+			if (completedItems % Server.FS_PACK_YIELD_INTERVAL === 0 || completedItems === fsList.length) {
+				onProgress?.(completedItems, fsList.length);
+				if (completedItems < fsList.length) {
+					await new Promise<void>(resolve => window.setTimeout(resolve, 0));
+				}
+			}
+		}
+		const data = new Uint8Array(totalSize);
+		let offset = 0;
+		for (const chunk of chunks) {
+			data.set(chunk, offset);
+			offset += chunk.byteLength;
 		}
 
 		// Send fs data
@@ -748,6 +1180,10 @@ export default class Server {
 				responseType: "binary",
 				retry: 0
 			}) as ArrayBuffer;
+		const actualBlockId = await utils.sha1(resp);
+		if (actualBlockId !== blockId) {
+			throw new Error(`Downloaded block failed integrity verification: expected '${blockId}', received '${actualBlockId}'.`);
+		}
 		if (this.crypto) {
 			return await this.crypto.decryptBlock(resp);
 		}
@@ -757,8 +1193,15 @@ export default class Server {
 	async sendBlock (id: string, data: ArrayBuffer): Promise<void> {
 		const needUpload = await this.checkBlock(id);
 		if (needUpload) {
-			await this.requestSeafHttp({ url: `repo/${this.settings.repoId}/block/${id}`, method: "PUT", body: data, retry: 0, responseType: "text" });
+			await this.uploadBlock(id, data);
 		}
+	}
+
+	// Upload a block already known to be absent. Callers that have a complete
+	// file manifest can batch check all block IDs and avoid one extra round trip
+	// per block by using this method directly.
+	async uploadBlock (id: string, data: ArrayBuffer): Promise<void> {
+		await this.requestSeafHttp({ url: `repo/${this.settings.repoId}/block/${id}`, method: "PUT", body: data, retry: 0, responseType: "text" });
 	}
 
 	// check if the blocks are in the server
