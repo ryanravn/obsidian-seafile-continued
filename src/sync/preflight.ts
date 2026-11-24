@@ -26,14 +26,19 @@ export function findCaseCollisions(parentPath: string, names: Iterable<string>):
 	const byFoldedName = new Map<string, string>();
 	const issues: PathPreflightIssue[] = [];
 	for (const name of names) {
-		const folded = name.normalize("NFC").toLocaleLowerCase("en-US");
+		// Some filename indexes and remote stacks treat non-breaking spaces as
+		// ordinary spaces. Detect that ambiguity without applying broad NFKC
+		// normalization to the filename that is actually synchronized.
+		const folded = name.normalize("NFC")
+			.replace(/[\u00a0\u202f]/g, " ")
+			.toLocaleLowerCase("en-US");
 		const previous = byFoldedName.get(folded);
 		if (previous && previous !== name) {
 			const base = parentPath.replace(/\/$/, "");
 			issues.push({
 				kind: "case-collision",
 				path: `${base}/${name}`,
-				detail: `collides with '${previous}' on case-insensitive filesystems`
+				detail: `collides with '${previous}' after portable case and space folding`
 			});
 		} else {
 			byFoldedName.set(folded, name);

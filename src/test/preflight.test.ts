@@ -22,6 +22,17 @@ describe("cross-platform path preflight", () => {
 			path: "/notes/README.md"
 		})]);
 	});
+
+	test("detects sibling names that differ only by narrow no-break space", () => {
+		expect(findCaseCollisions("/attachments", [
+			"Screenshot 2026-11-09 at 1.23.45 PM.png",
+			"Screenshot 2026-11-09 at 1.23.45\u202fPM.png"
+		])).toEqual([expect.objectContaining({
+			kind: "case-collision",
+			path: "/attachments/Screenshot 2026-11-09 at 1.23.45\u202fPM.png",
+			detail: expect.stringContaining("space folding")
+		})]);
+	});
 });
 
 describe("mass-deletion safety threshold", () => {
